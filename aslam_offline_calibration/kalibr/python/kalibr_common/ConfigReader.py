@@ -1,4 +1,4 @@
-from __future__ import print_function #handle print in 2.x python
+from __future__ import print_function
 import yaml
 import sys
 import numpy as np
@@ -10,7 +10,11 @@ import aslam_cv_backend as cvb
 import sm
 
 class AslamCamera(object):
-    def __init__(self, camera_model, intrinsics, dist_model, dist_coeff, resolution):
+    def __init__(self, camera_model, intrinsics, dist_model, dist_coeff, resolution, lineDelayNanos):
+        if lineDelayNanos == 0:
+            self.shutterType = cv.GlobalShutter
+        else:
+            self.shutterType = cv.RollingShutter
         #setup the aslam camera
         if camera_model == 'pinhole':
             focalLength = intrinsics[0:2]
@@ -24,12 +28,17 @@ class AslamCamera(object):
                                                      principalPoint[0], principalPoint[1], 
                                                      resolution[0], resolution[1], 
                                                      dist)
-                
-                self.geometry = cv.DistortedPinholeCameraGeometry(proj)
-        
-                self.frameType = cv.DistortedPinholeFrame
                 self.keypointType = cv.Keypoint2
-                self.reprojectionErrorType = cvb.DistortedPinholeReprojectionErrorSimple
+                if lineDelayNanos == 0:
+                    cameraModel = cvb.DistortedPinhole
+                    self.reprojectionErrorType = cameraModel.reprojectionError
+                else:
+                    cameraModel = cvb.DistortedPinholeRs
+                    self.reprojectionErrorType = cameraModel.reprojectionErrorAdaptiveCovariance
+
+                self.frameType = cameraModel.frameType
+                self.geometry = cameraModel.geometry(proj)
+                self.dv = cameraModel.designVariable(self.geometry)
                 self.undistorterType = cv.PinholeUndistorterNoMask
                 
             elif dist_model == 'equidistant':
@@ -39,12 +48,17 @@ class AslamCamera(object):
                                                           principalPoint[0], principalPoint[1], 
                                                           resolution[0], resolution[1], 
                                                           dist)
-                
-                self.geometry = cv.EquidistantDistortedPinholeCameraGeometry(proj)
-                
-                self.frameType = cv.EquidistantDistortedPinholeFrame
                 self.keypointType = cv.Keypoint2
-                self.reprojectionErrorType = cvb.EquidistantDistortedPinholeReprojectionErrorSimple
+                if lineDelayNanos == 0:
+                    cameraModel = cvb.EquidistantPinhole
+                    self.reprojectionErrorType = cameraModel.reprojectionError
+                else:
+                    cameraModel = cvb.EquidistantPinholeRs
+                    self.reprojectionErrorType = cameraModel.reprojectionErrorAdaptiveCovariance
+
+                self.frameType = cameraModel.frameType
+                self.geometry = cameraModel.geometry(proj)
+                self.dv = cameraModel.designVariable(self.geometry)
                 self.undistorterType = cv.EquidistantPinholeUndistorterNoMask
                 
             elif dist_model == 'fov':
@@ -53,23 +67,35 @@ class AslamCamera(object):
                 proj = cv.FovPinholeProjection(focalLength[0], focalLength[1], 
                                                principalPoint[0], principalPoint[1], 
                                                resolution[0], resolution[1], dist)
-                
-                self.geometry = cv.FovDistortedPinholeCameraGeometry(proj)
-                
-                self.frameType = cv.FovDistortedPinholeFrame
                 self.keypointType = cv.Keypoint2
-                self.reprojectionErrorType = cvb.FovDistortedPinholeReprojectionErrorSimple
+                if lineDelayNanos == 0:
+                    cameraModel = cvb.FovPinhole
+                    self.reprojectionErrorType = cameraModel.reprojectionError
+                else:
+                    cameraModel = cvb.FovPinholeRs
+                    self.reprojectionErrorType = cameraModel.reprojectionErrorAdaptiveCovariance
+
+                self.frameType = cameraModel.frameType
+                self.geometry = cameraModel.geometry(proj)
+                self.dv = cameraModel.designVariable(self.geometry)
+
                 self.undistorterType = cv.FovPinholeUndistorterNoMask
             elif dist_model == 'none':
                 proj = cv.PinholeProjection(focalLength[0], focalLength[1], 
                                             principalPoint[0], principalPoint[1], 
                                             resolution[0], resolution[1])
-                
-                self.camera = cv.PinholeCameraGeometry(proj)
-                
-                self.frameType = cv.PinholeFrame
+
                 self.keypointType = cv.Keypoint2
-                self.reprojectionErrorType = cvb.PinholeReprojectionErrorSimple
+                if lineDelayNanos == 0:
+                    self.frameType = cv.PinholeFrame
+                    self.geometry = cv.PinholeCameraGeometry(proj)
+                    self.dv = cvb.PinholeCameraGeometryDesignVariable(self.geometry)
+                    self.reprojectionErrorType = cvb.PinholeReprojectionError
+                else:
+                    self.frameType = cv.PinholeRsFrame
+                    self.geometry = cv.PinholeRsCameraGeometry(proj)
+                    self.dv = cvb.PinholeRsCameraGeometryDesignVariable(self.geometry)
+                    self.reprojectionErrorType = cvb.PinholeRsReprojectionErrorAdaptiveCovariance
             else:
                 self.raiseError("pinhole camera model does not support distortion model '{}'".format(dist_model))
                 
@@ -86,32 +112,39 @@ class AslamCamera(object):
                                                         principalPoint[0], principalPoint[1], 
                                                         resolution[0], resolution[1], 
                                                         dist)
-
-                self.geometry = cv.DistortedOmniCameraGeometry(proj)
-                
-                self.frameType = cv.DistortedOmniFrame
                 self.keypointType = cv.Keypoint2
-                self.reprojectionErrorType = cvb.DistortedOmniReprojectionErrorSimple
+                if lineDelayNanos == 0:
+                    cameraModel = cvb.DistortedOmni
+                    self.reprojectionErrorType = cameraModel.reprojectionError
+                else:
+                    cameraModel = cvb.DistortedOmniRs
+                    self.reprojectionErrorType = cameraModel.reprojectionErrorAdaptiveCovariance
+
+                self.frameType = cameraModel.frameType
+                self.geometry = cameraModel.geometry(proj)
+                self.dv = cameraModel.designVariable(self.geometry)
+
                 self.undistorterType = cv.OmniUndistorterNoMask
                 
             elif dist_model == 'equidistant':
-                
                 raise RuntimeError("Omni with equidistant model not yet supported!")
-                
-                dist = cv.EquidistantPinholeProjection(dist_coeff[0], dist_coeff[1], 
-                                                           dist_coeff[2], dist_coeff[3])
+                dist = cv.EquidistantPinholeProjection(dist_coeff[0], dist_coeff[1],
+                                                       dist_coeff[2], dist_coeff[3])
                 
                 proj = cv.EquidistantOmniProjection(xi_omni, focalLength[0], focalLength[1], 
                                                         principalPoint[0], principalPoint[1], 
                                                         resolution[0], resolution[1], 
                                                         dist)
-                
-                
-                self.geometry = cv.EquidistantDistortedOmniCameraGeometry(proj)
-                
                 self.frameType = cv.DistortedOmniFrame
                 self.keypointType = cv.Keypoint2
-                self.reprojectionErrorType = cvb.EquidistantDistortedOmniReprojectionErrorSimple
+                if lineDelayNanos == 0:
+                    self.geometry = cv.EquidistantDistortedOmniCameraGeometry(proj)
+                    self.dv = cvb.EquidistantDistortedOmniCameraGeometryDesignVariable(self.geometry)
+                    self.reprojectionErrorType = cvb.EquidistantDistortedOmniReprojectionError
+                else:
+                    self.geometry = cv.EquidistantDistortedOmniRsCameraGeometry(proj)
+                    self.dv = cvb.EquidistantDistortedOmniRsCameraGeometryDesignVariable(self.geometry)
+                    self.reprojectionErrorType = cvb.EquidistantDistortedOmniRsReprojectionErrorAdaptiveCovariance
 
             elif dist_model == 'none':
 
@@ -119,11 +152,16 @@ class AslamCamera(object):
                                                         principalPoint[0], principalPoint[1],
                                                         resolution[0], resolution[1])
 
-                self.geometry = cv.OmniCameraGeometry(proj)
-
                 self.frameType = cv.OmniFrame
                 self.keypointType = cv.Keypoint2
-                self.reprojectionErrorType = cvb.OmniReprojectionErrorSimple
+                if lineDelayNanos == 0:
+                    self.geometry = cv.OmniCameraGeometry(proj)
+                    self.dv = cvb.OmniCameraGeometryDesignVariable(self.geometry)
+                    self.reprojectionErrorType = cvb.OmniReprojectionError
+                else:
+                    self.geometry = cv.OmniRsCameraGeometry(proj)
+                    self.dv = cvb.OmniRsCameraGeometryDesignVariable(self.geometry)
+                    self.reprojectionErrorType = cvb.OmniRsReprojectionErrorAdaptiveCovariance
 
             else:
                 raise RuntimeError("omni camera model does not support distortion model '{}'".format(dist_model))
@@ -138,13 +176,11 @@ class AslamCamera(object):
                 proj = cv.ExtendedUnifiedProjection(alpha_uni, beta_uni, focalLength[0], focalLength[1],
                                                     principalPoint[0], principalPoint[1],
                                                     resolution[0], resolution[1])
-
                 self.geometry = cv.ExtendedUnifiedCameraGeometry(proj)
-
+                self.dv = cvb.ExtendedUnifiedCameraGeometryDesignVariable(self.geometry)
                 self.frameType = cv.ExtendedUnifiedFrame
                 self.keypointType = cv.Keypoint2
-                self.reprojectionErrorType = cvb.ExtendedUnifiedReprojectionErrorSimple
-
+                self.reprojectionErrorType = cvb.ExtendedUnifiedReprojectionError
             else:
                 raise RuntimeError("camera model {} does not support distortion model '{}'".format(camera_model, dist_model))
         
@@ -160,15 +196,16 @@ class AslamCamera(object):
                                                  resolution[0], resolution[1])
 
                 self.geometry = cv.DoubleSphereCameraGeometry(proj)
-                
+                self.dv = cvb.DoubleSphereCameraGeometryDesignVariable(self.geometry)
                 self.frameType = cv.DoubleSphereFrame
                 self.keypointType = cv.Keypoint2
-                self.reprojectionErrorType = cvb.DoubleSphereReprojectionErrorSimple
+                self.reprojectionErrorType = cvb.DoubleSphereReprojectionError
             else:
                 raise RuntimeError("camera model {} does not support distortion model '{}'".format(camera_model, dist_model))
 
         else:
             raise RuntimeError("Unknown camera model '{}'".format(camera_model))
+        self.geometry.shutter().setParameters(np.array([lineDelayNanos * 1e-9]))
         
     @classmethod
     def fromParameters(cls, params):
@@ -176,8 +213,9 @@ class AslamCamera(object):
         camera_model, intrinsics = params.getIntrinsics()
         dist_model, dist_coeff = params.getDistortion()
         resolution = params.getResolution()
-        return AslamCamera(camera_model, intrinsics, dist_model, dist_coeff, resolution)
-        
+        lineDelayNanos = params.getLineDelayNanos()
+        return AslamCamera(camera_model, intrinsics, dist_model, dist_coeff, resolution, lineDelayNanos)
+
 
 #wrapper to ctach all KeyError exception (field missing in yaml ...)
 def catch_keyerror(f):
@@ -220,7 +258,7 @@ class ParametersBase(object):
         
         try:
             with open(filename, 'w') as outfile:
-                outfile.write( yaml.dump(self.data, default_flow_style=None, width=2147483647) )
+                outfile.write( yaml.dump(self.data) )
         except:
             self.raiseError( "Could not write configuration to {0}".format(self.yamlFile) )
 
@@ -378,6 +416,54 @@ class CameraParameters(ParametersBase):
         self.checkResolution(resolution)
         self.data["resolution"] = resolution
     
+    def checkLineDelay(self, lineDelay):
+        if not isinstance(lineDelay, int) or lineDelay < 0:
+            self.raiseError("line delay should be an integer in nanoseconds and no less than 0.")
+
+    @catch_keyerror
+    def getLineDelayNanos(self):
+        if "line_delay_nanoseconds" in self.data:
+            self.checkLineDelay(self.data["line_delay_nanoseconds"])
+            return self.data["line_delay_nanoseconds"]
+        else:
+            defaultLineDelay = 0
+            sm.logWarn("\"line_delay_nanoseconds\" is not found in {},"
+                       " will default to {}.".format(self.yamlFile, defaultLineDelay))
+            return defaultLineDelay
+
+    def setLineDelayNanos(self, lineDelay):
+        self.checkLineDelay(lineDelay)
+        self.data["line_delay_nanoseconds"] = lineDelay
+
+    def hasImageNoise(self):
+        return "image_noise_std_dev" in self.data
+
+    def checkImageNoise(self, imageNoise):
+        if not isinstance(imageNoise, float) or imageNoise < 0.0:
+            self.raiseError("invalid image noise")
+
+    @catch_keyerror
+    def getImageNoise(self):
+        self.checkImageNoise(self.data["image_noise_std_dev"])
+        return self.data["image_noise_std_dev"] 
+
+    def setImageNoise(self, imageNoise):
+        self.checkImageNoise(imageNoise)
+        self.data["image_noise_std_dev"] = imageNoise
+
+    def checkUpdateRate(self, update_rate):
+        if update_rate <= 0.0:
+            self.raiseError("invalid update_rate")
+    
+    @catch_keyerror
+    def getUpdateRate(self):
+        self.checkUpdateRate(self.data["update_rate"])       
+        return self.data["update_rate"]
+    
+    def setUpdateRate(self, update_rate):
+        self.checkUpdateRate(update_rate)
+        self.data["update_rate"] = update_rate
+
     ###################################################
     # Helpers
     ###################################################
@@ -460,6 +546,48 @@ class ImuParameters(ParametersBase):
         self.checkUpdateRate(update_rate)
         self.data["update_rate"] = update_rate
     
+    def checkBias(self, bias):
+        if len(bias)!=3 or not isinstance(bias[0],float) or \
+                not isinstance(bias[1],float) or not isinstance(bias[2],float):
+            self.raiseError("invalid bias")
+
+    def getInitialGyroBias(self):
+        self.checkBias(self.data["initial_gyro_bias"])
+        return self.data["initial_gyro_bias"]
+
+    def setInitialGyroBias(self, gyroBias):
+        self.checkBias(gyroBias)
+        self.data["initial_gyro_bias"] = gyroBias
+
+    def getInitialAccBias(self):
+        self.checkBias(self.data["initial_accelerometer_bias"])
+        return self.data["initial_accelerometer_bias"]
+
+    def setInitialAccBias(self, accBias):
+        self.checkBias(accBias)
+        self.data["initial_accelerometer_bias"] = accBias
+
+    def checkGravity(self, gravity):
+        if len(gravity)!=3 or not isinstance(gravity[0],float) or \
+                not isinstance(gravity[1],float) or not isinstance(gravity[2],float) or \
+                np.linalg.norm(gravity) < 5.0 or np.linalg.norm(gravity) > 20.0:
+            self.raiseError("invalid gravity")
+
+    def getGravityInTarget(self):
+        if "gravity_in_target" in self.data:
+            self.checkGravity(self.data["gravity_in_target"])
+            return self.data["gravity_in_target"]
+        else:
+            gW = [0, 9.81, 0]
+            sm.logWarn("\"gravity_in_target\" is not found in {}, "
+                       "will default to {}. Note that in kalibr "
+                       "only its magnitude matters.".format(self.yamlFile, gW))
+            return gW
+
+    def setGravityInTarget(self, gravityInTarget):
+        self.checkGravity(gravityInTarget)
+        self.data["gravity_in_target"] = gravityInTarget.tolist()
+
     #accelerometer statistics
     def checkAccelerometerStatistics(self, noise_density, random_walk):
         if noise_density <= 0.0:
@@ -741,6 +869,34 @@ class CameraChainParameters(ParametersBase):
             if cam_id >= self.numCameras():
                 self.raiseError("out-of-range: camera id of {0}".format(cam_id))
 
+    def getLineDelay(self, camNr):
+        if "line_delay_nanoseconds" in self.data["cam{0}".format(camNr)]:
+            return self.data["cam{0}".format(camNr)]["line_delay_nanoseconds"]
+        else:
+            defaultLineDelay = 0
+            sm.logWarn("\"line_delay_nanoseconds\" is not found in {} for camera {},"
+                       " will default to {}.".format(self.yamlFile, camNr, defaultLineDelay))
+            return defaultLineDelay
+
+    def setLineDelay(self, camNr, line_delay_nanos):
+        self.data["cam{0}".format(camNr)]["line_delay_nanoseconds"] = line_delay_nanos
+
+    @catch_keyerror
+    def getDistortion(self, camNr):
+        return self.data["cam{0}".format(camNr)]["distortion_model"], self.data["cam{0}".format(camNr)]["distortion_coeffs"]
+
+    def setDistortion(self, camNr, model, coeffs):
+        self.data["cam{0}".format(camNr)]["distortion_model"] = model
+        self.data["cam{0}".format(camNr)]["distortion_coeffs"] = [float(val) for val in coeffs]
+
+    @catch_keyerror
+    def getIntrinsics(self, camNr):
+        return self.data["cam{0}".format(camNr)]["camera_model"], self.data["cam{0}".format(camNr)]["intrinsics"]
+
+    def setIntrinsics(self, camNr, model, intrinsics):
+        self.data["cam{0}".format(camNr)]["camera_model"] = model
+        self.data["cam{0}".format(camNr)]["intrinsics"] = [float(val) for val in intrinsics]
+
     @catch_keyerror
     def getCamOverlaps(self, camNr):
         self.checkCamOverlaps(camNr, self.data["cam{0}".format(camNr)]["cam_overlaps"])       
@@ -765,4 +921,11 @@ class CameraChainParameters(ParametersBase):
                 print("  baseline:", T.T(), file=dest)
             except:
                 print("  baseline: no data available", file=dest)
+                pass
+            #print T_cam_imu if available
+            try:
+                T = self.getExtrinsicsImuToCam(camNr)
+                print("  T_cam_imu:", T.T(), file=dest)
+            except:
+                print("  T_cam_imu: no data available", file=dest)
                 pass

@@ -33,7 +33,6 @@ void GridDetector::initializeDetector()
 {
   if (_options.plotCornerReprojection) {
     cv::namedWindow("Corner reprojection", cv::WINDOW_NORMAL);
-    cv::resizeWindow("Corner reprojection", 640, 480);
   }
 }
 
@@ -130,17 +129,19 @@ bool GridDetector::findTarget(const cv::Mat & image, const aslam::Time & stamp,
       SM_DEBUG_STREAM("estimateTransformation() failed");
   }
 
-  //calculate reprojection errors
-  auto compute_stats = [&](double &mean, double &std, Eigen::MatrixXd &reprojection_errors_norm,
-                           std::vector<cv::Point2f> &corners_reproj, std::vector<cv::Point2f> &corners_detected) {
-    
-    corners_reproj.clear();
-    corners_detected.clear();
+  //remove corners with a reprojection error above a threshold
+  //(remove detection outliers)
+  if(_options.filterCornerOutliers && success)
+  {
+    //calculate reprojection errors
+    std::vector<cv::Point2f> corners_reproj;
+    std::vector<cv::Point2f> corners_detected;
     outObservation.getCornerReprojection(_geometry, corners_reproj);
     unsigned int numCorners = outObservation.getCornersImageFrame(corners_detected);
 
     //calculate error norm
-    reprojection_errors_norm = Eigen::MatrixXd::Zero(numCorners,1);
+    Eigen::MatrixXd reprojection_errors_norm = Eigen::MatrixXd::Zero(numCorners,1);
+
     for(unsigned int i=0; i<numCorners; i++ )
     {
       cv::Point2f reprojection_err = corners_detected[i] - corners_reproj[i];
@@ -150,8 +151,8 @@ bool GridDetector::findTarget(const cv::Mat & image, const aslam::Time & stamp,
     }
 
     //calculate statistics
-    mean = reprojection_errors_norm.mean();
-    std = 0.0;
+    double mean = reprojection_errors_norm.mean();
+    double std = 0.0;
     for(unsigned int i=0; i<numCorners; i++)
     {
       double temp = reprojection_errors_norm(i,0)-mean;
@@ -159,18 +160,6 @@ bool GridDetector::findTarget(const cv::Mat & image, const aslam::Time & stamp,
     }
     std /= (double)numCorners;
     std = sqrt(std);
-
-  };
-
-  //remove corners with a reprojection error above a threshold
-  //(remove detection outliers)
-  if(_options.filterCornerOutliers && success)
-  {
-    //calculate reprojection errors
-    double mean, std;
-    Eigen::MatrixXd reprojection_errors_norm;
-    std::vector<cv::Point2f> corners_reproj, corners_detected;
-    compute_stats(mean, std, reprojection_errors_norm, corners_reproj, corners_detected);
 
     //disable outlier corners
     std::vector<unsigned int> cornerIdx;
@@ -189,7 +178,7 @@ bool GridDetector::findTarget(const cv::Mat & image, const aslam::Time & stamp,
     }
 
     if(removeCount>0)
-      SM_DEBUG_STREAM("removed " << removeCount << " of " << reprojection_errors_norm.rows() << " calibration target corner outliers\n";);
+      SM_DEBUG_STREAM("removed " << removeCount << " of " << numCorners << " calibration target corner outliers\n";);
   }
 
 
@@ -206,24 +195,6 @@ bool GridDetector::findTarget(const cv::Mat & image, const aslam::Time & stamp,
       for (unsigned int i = 0; i < reprojs.size(); i++)
         cv::circle(imageCopy1, reprojs[i], 3, CV_RGB(255,0,0), 1);
 
-      //calculate reprojection errors
-      double mean, std;
-      Eigen::MatrixXd reprojection_errors_norm;
-      std::vector<cv::Point2f> corners_reproj, corners_detected;
-      compute_stats(mean, std, reprojection_errors_norm, corners_reproj, corners_detected);
-      
-      // show the on the rendered image
-      auto format_str = [](double data) {
-        std::ostringstream ss;
-        ss << std::setprecision(3) << data;
-        return ss.str();
-      };
-      cv::putText(imageCopy1, "reproj err mean: " + format_str(mean), 
-                  cv::Point(50, 50), cv::FONT_HERSHEY_SIMPLEX, 0.8,
-                  CV_RGB(0,255,0), 3, 8, false);
-      cv::putText(imageCopy1, "reproj err std: " + format_str(std), 
-                  cv::Point(50, 100), cv::FONT_HERSHEY_SIMPLEX, 0.8,
-                  CV_RGB(0,255,0), 3, 8, false);
 
     } else {
       cv::putText(imageCopy1, "Detection failed! (frame not used)",

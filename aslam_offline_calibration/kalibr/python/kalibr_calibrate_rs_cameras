@@ -20,13 +20,15 @@ import argparse
 import sys
 import random
 import signal
+import time
 
 np.set_printoptions(suppress=True)
 
-def __initBagDataset(bagfile, topic, from_to, freq):
+def __initBagDataset(bagfile, topic, from_to, perform_syncrhronization):
     print("\tDataset:          {0}".format(bagfile))
     print("\tTopic:            {0}".format(topic))
-    reader = kc.BagImageDatasetReader(bagfile, topic, bag_from_to=from_to, bag_freq=freq)
+    reader = kc.BagImageDatasetReader(bagfile, topic, bag_from_to=from_to,
+                                      perform_synchronization=perform_syncrhronization)
     print("\tNumber of images: {0}".format(reader.numImages()))
     return reader
 
@@ -35,11 +37,13 @@ cameraModels = {
     # rolling shutter
     'pinhole-radtan-rs': acvb.DistortedPinholeRs,
     'pinhole-equi-rs':   acvb.EquidistantPinholeRs,
+    'pinhole-fov-rs':    acvb.FovPinholeRs,
     'omni-radtan-rs':    acvb.DistortedOmniRs,
     # global shutter
     'pinhole-radtan':    acvb.DistortedPinhole,
     'pinhole-equi':      acvb.EquidistantPinhole,
-    'omni-radtan':       acvb.DistortedOmni
+    'pinhole-fov':       acvb.FovPinhole,
+    'omni-radtan':       acvb.DistortedOmni,
 }
 
 def __signal_exit(signal, frame):
@@ -83,25 +87,55 @@ def __parseArgs():
 
     parser = KalibrArgParser(description='Calibrate the intrinsics of a single rolling shutter camera.', usage=usage)
     parser.add_argument('--model', dest='model', help='The camera model to estimate. '
-                        'Currently supported models are {0}, where the suffix \'-rs\' identifies rolling shutter models.'.format(', '.join(list(cameraModels.keys()))), required=True)
-    parser.add_argument('--frame-rate', dest='framerate', type=int, help='Approximate framerate of the camera.', required=True)
+                        'Currently supported models are {0}, where the suffix \'-rs\' identifies rolling shutter models.'.format(', '.join(cameraModels.keys())), required=True)
 
     groupSource = parser.add_argument_group('Data source')
     groupSource.add_argument('--bag', dest='bagfile', help='The bag file with the data.')
     groupSource.add_argument('--topic', dest='topic', help='The image topic.', required=True)
     groupSource.add_argument('--bag-from-to', metavar='bag_from_to', type=float, nargs=2, help='Use the bag data starting from up to this time [s].')
-    groupSource.add_argument('--bag-freq', metavar='bag_freq', type=float, help='Frequency to extract features at [hz]')
 
     groupTarget = parser.add_argument_group('Calibration target configuration')
     groupTarget.add_argument('--target', dest='targetYaml', help='Calibration target configuration as yaml file.', required=True)
-    groupTarget.add_argument('--inverse-feature-variance', dest='inverseFeatureVariance', type=float, help='Estimated inverse variance of the feature detector.', required=True)
+    groupTarget.add_argument('--feature-variance', dest='featureVariance', type=float, help='Estimated variance of the feature detector.', required=True)
 
     groupOpt = parser.add_argument_group('Optimization options')
     groupOpt.add_argument('--max-iter', type=int, default=30, dest='max_iter', help='Max. iterations (default: %(default)s).', required=False)
+    groupOpt.add_argument('--recover-covariance', action='store_true', dest='recover_cov',
+                          help='Recover the covariance of the design variables.', required=False)
+    groupOpt.add_argument('--lock-intrinsics', action='store_true', dest='lock_intrinsics', help='Disable the intrinsics calibration', required=False)      
+    groupOpt.add_argument('--lock-distortion', action='store_true', dest='lock_distortion', help='Disable the distortion calibration', required=False)
+    groupOpt.add_argument('--time-calibration', action='store_true', dest='time_calibration', help='Enable time shift cam_imu calibration', required=False)
+    groupOpt.add_argument('--timeoffset-padding', type=float, default=0.5, dest='timeoffset_padding',
+                          help='Maximum range in which the timeoffset may change during estimation [s] '
+                               '(default: %(default)s)', required=False)
+    groupOpt.add_argument('--timeoffset-pattern', type=float, default=80e-3, dest='timeoffset_pattern',
+                          help='A time offset to pad the blocks generated in the hessian/jacobian to ensure'
+                               ' a constant symbolic representation of the batch estimation problem, even when a change'
+                               ' in the shutter timing shifts the capture time to another spline segment.')
+
+    groupCam = parser.add_argument_group('Camera system configuration')
+    groupCam.add_argument('--cams', dest='chain_yaml', help=('Camera system configuration as yaml file.\n'
+        'If camera yaml is provided, then values from the yaml will be used for initializing the camera'), required=False)
+    # TODO(jhuai): Currently the optimization with IMU data does not converge at all.
+    groupImu = parser.add_argument_group('IMU configuration')
+    groupImu.add_argument('--imu', dest='imu_yaml', help=('Yaml holding the IMU noise parameters.'
+            ' Thanks to the ConfigReader, no hierarchy should be used in the yaml.'))
+    groupImu.add_argument('--imu-model', dest='imu_model', help= \
+            ('The IMU models to estimate. Currently supported are \'calibrated\','
+             ' \'scale-misalignment\' and \'scale-misalignment-size-effect\'.'), default="calibrated")
+    groupImu.add_argument('--constant_bias', action='store_true', help="bias is constant or time-varying")
+    groupImu.add_argument('--perform_synchronization', action='store_true',
+                           help=('Perform a clock synchronization according to '
+                                '\'Clock synchronization algorithms for network measurements\' '
+                                 'by Zhang et al. (2002).'))
 
     outputSettings = parser.add_argument_group('Output options')
     outputSettings.add_argument('--verbose', action='store_true', dest='verbose', help='Enable (really) verbose output (disables plots).')
     outputSettings.add_argument('--show-extraction', action='store_true', dest='showextraction', help='Show the calibration target extraction. (disables plots).')
+    outputSettings.add_argument('--save-sample-poses', action='store_true', dest='saveSamplePoses',
+                                help='Save sampled poses from the optimized B-splines?')
+    parser.add_argument('--reproject-frame-index', dest='reprojectFrameIndex', type=int, default=0,
+                        help='Zero-based index of the frame for reprojection in the frames used by calibration.')
 
     # print help if no argument is specified
     if len(sys.argv)==1:
@@ -121,6 +155,23 @@ def __parseArgs():
 
     return parsed
 
+# perform corner extraction from bagfile
+# returns the observations
+def __extractObservations(cameraGeometry, verbose=False):
+    if cameraGeometry.dataset.hasFeatureAssociations():
+        return cameraGeometry.dataset.getFeatureAssociations()
+    else:
+        # extract the targets
+        multithreading = False #not verbose
+        observations = kc.extractCornersFromDataset(
+            cameraGeometry.dataset,
+            cameraGeometry.ctarget.detector,
+            multithreading=multithreading,
+            # transformation estimation will fail with rs cameras and significant distortions
+            noTransformation=True
+        )
+        return observations
+
 def main():
     parsed = __parseArgs()
 
@@ -136,34 +187,49 @@ def main():
     ######
     ## load bagfile and extract targets:
     targetConfig = kc.CalibrationTargetParameters(parsed.targetYaml)
-    dataset = __initBagDataset(parsed.bagfile, parsed.topic, parsed.bag_from_to, parsed.bag_freq)
+    if parsed.bagfile.endswith('.bag'):
+        dataset = __initBagDataset(parsed.bagfile, parsed.topic, parsed.bag_from_to, parsed.perform_synchronization)
+    else:
+        dataset = kc.VimapCsvReader(parsed.bagfile, parsed.topic, parsed.bag_from_to, False)
 
     #create camera
     cameraModel = cameraModels[parsed.model]
     cameraGeometry = kcc.CameraGeometry(cameraModel, targetConfig, dataset, verbose=(parsed.verbose or parsed.showextraction))
 
-    # extract observations of the targets
-    multithreading = not (parsed.verbose or parsed.showextraction)
-    observations = kc.extractCornersFromDataset(
-        cameraGeometry.dataset,
-        cameraGeometry.ctarget.detector,
-        multithreading=multithreading,
-        # transformation estimation will fail with rs cameras and significant distortions
-        noTransformation=True
-    )
+    # extract observations
+    # Because of python2, perf_counter is not available. 
+    # Because of Unix, we choose to use time.time() instead of time.clock().
+    tic = time.time()
+    observations = __extractObservations(cameraGeometry,(parsed.verbose or parsed.showextraction))
+    toc = time.time()
+    extract_time = toc - tic
 
     # Calibration Configuration
     config = rscc.RsCalibratorConfiguration()
-    config.inverseFeatureCovariance = 1.0/parsed.inverseFeatureVariance
+    config.inverseFeatureCovariance = 1.0/parsed.featureVariance
     config.maxNumberOfIterations = parsed.max_iter
-    config.framerate = parsed.framerate
-    config.timeOffsetConstantSparsityPattern = 0.08
-    config.timeOffsetPadding = 0.5
+    config.timeOffsetConstantSparsityPattern = parsed.timeoffset_pattern
+    config.timeOffsetPadding = parsed.timeoffset_padding
+    config.recoverCov = parsed.recover_cov
+    config.estimateParameters['intrinsics'] = not parsed.lock_intrinsics
+    config.estimateParameters['distortion'] = not parsed.lock_distortion
+    config.estimateParameters['timeOffset'] = parsed.time_calibration and (parsed.imu_yaml is not None)
+    config.chain_yaml = parsed.chain_yaml
+    config.saveSamplePoses = parsed.saveSamplePoses
+    config.reprojectFrameIndex = parsed.reprojectFrameIndex
 
     ######
     ## Calibrate
     calibrator = rscc.RsCalibrator()
+    imuDescription = rscc.ImuDataDescription([parsed.bagfile], parsed.bag_from_to,
+                                             parsed.perform_synchronization, parsed.constant_bias)
+    calibrator.loadImu(parsed.imu_yaml, parsed.imu_model, imuDescription)
+    tic = time.time()
     calibrator.calibrate(cameraGeometry, observations, config)
+    toc = time.time()
+    calibrate_time = toc - tic
+    print("Timing (sec): Extraction observations {:.4f}, rolling shutter calibration {:.4f}".format(
+        extract_time, calibrate_time))
 
 if __name__ == "__main__":
     try:

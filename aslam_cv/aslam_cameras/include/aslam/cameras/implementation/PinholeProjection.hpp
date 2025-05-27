@@ -774,8 +774,7 @@ bool PinholeProjection<DISTORTION_T>::initializeIntrinsics(const std::vector<Gri
           continue;
 
          double f_guess = cv::norm(ipts.at(0) - ipts.at(1)) / M_PI;
-         if(std::isfinite(f_guess))
-            f_guesses.push_back(f_guess);
+         f_guesses.push_back(f_guess);
       }
     }
   }
@@ -792,6 +791,11 @@ bool PinholeProjection<DISTORTION_T>::initializeIntrinsics(const std::vector<Gri
     } else {
       std::cout << "Initialization of focal length failed. You can enable"
         << " manual input by setting 'KALIBR_MANUAL_FOCAL_LENGTH_INIT'." << std::endl;
+      std::cout << "To do so, in a bash shell, use below lines.\n";
+      std::cout << "export KALIBR_MANUAL_FOCAL_LENGTH_INIT=1\n";
+      std::cout << "# ./appname arguments <<< focal_length_in_pixels\n";
+      std::cout << "# Note that replace appname, arguments, and focal length accordingly.\n";
+      std::cout << "For instance, appname can be kalibr_calibrate_imu_camera.\n";
       return false;
     }
   }
@@ -833,7 +837,7 @@ size_t PinholeProjection<DISTORTION_T>::computeReprojectionError(
 /// \return true on success
 template<typename DISTORTION_T>
 bool PinholeProjection<DISTORTION_T>::estimateTransformation(
-    const GridCalibrationTargetObservation & obs,
+    const ObservationInterface & obs,
     sm::kinematics::Transformation & out_T_t_c) const {
 
   std::vector<cv::Point2f> Ms;

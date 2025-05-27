@@ -15,13 +15,11 @@ class BagImuDatasetReaderIterator(object):
         self.iter = self.indices.__iter__()
     def __iter__(self):
         return self
-    def next(self):
-        # required for python 2.x compatibility
-        idx = next(self.iter)
-        return self.dataset.getMessage(idx)
     def __next__(self):
         idx = next(self.iter)
         return self.dataset.getMessage(idx)
+
+    next = __next__  # Python 2
 
 class BagImuDatasetReader(object):
     def __init__(self, bagfile, imutopic, bag_from_to=None, perform_synchronization=False):
@@ -72,11 +70,11 @@ class BagImuDatasetReader(object):
         timestamps=list()
         for idx in self.indices:
             topic, data, stamp = self.bag._read_message(self.index[idx].position)
-            timestamp = data.header.stamp.secs + data.header.stamp.nsecs/1.0e9
+            timestamp = stamp.secs + stamp.nsecs / 1.0e9
             timestamps.append(timestamp)
 
-        bagstart = min(timestamps)
-        baglength = max(timestamps)-bagstart
+        bagstart = self.bag.get_start_time()
+        baglength = self.bag.get_end_time() - bagstart
         print("bagstart", bagstart)
         print("baglength", baglength)
         #some value checking
@@ -91,7 +89,7 @@ class BagImuDatasetReader(object):
         valid_indices = []
         for idx, timestamp in enumerate(timestamps):
              if timestamp>=(bagstart+bag_from_to[0]) and timestamp<=(bagstart+bag_from_to[1]):
-                 valid_indices.append(idx)  
+                 valid_indices.append(idx)
         sm.logWarn("BagImuDatasetReader: truncated {0} / {1} messages.".format(len(indices)-len(valid_indices), len(indices)))
         
         return valid_indices

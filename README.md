@@ -43,6 +43,7 @@ Put the files in FOLDER path of choice.
 
 Build the docker container for the ROS version of choice.
 Use the updated docker file or an entrypoint error will occur.
+(see https://stackoverflow.com/questions/60725360/problem-when-running-docker-image-roskinetic-standard-init-linux-go211-exec)
 
     cd kalibr/docker/melodic
     chmod +x build.sh

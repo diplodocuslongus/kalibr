@@ -1,5 +1,6 @@
 #include <aslam/backend/BSplineMotionError.hpp>
 #include <stdio.h>
+#include <sm/logging.hpp>
 namespace aslam {
     namespace backend {
         
@@ -83,10 +84,10 @@ namespace aslam {
         {
                       
           // this is an error...
-          SM_THROW(Exception, "This is currently unsupported");
-          
+          SM_WARN("BSplineMotionError<SPLINE_T>::evaluateJacobiansImplementation is currently void");
+          // TODO(jhuai): This can be implemented similarly to MarginalizationPriorErrorTerm which is done with SVD.
+          // It can be tested against buildHessianImplementation.
         }
-          
           
           
         template<class SPLINE_T>

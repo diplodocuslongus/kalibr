@@ -7,8 +7,7 @@ from kalibr_imu_camera_calibration import *
 import numpy as np
 import argparse
 import signal
-import sys
-import os
+import sys   
 
 # make numpy print prettier
 np.set_printoptions(suppress=True)
@@ -26,7 +25,8 @@ class Once(argparse.Action):
             raise argparse.ArgumentError(None, msg)
         setattr(namespace, self.dest, values)
 
-def parseArgs():
+
+def createParser():
     class KalibrArgParser(argparse.ArgumentParser):
         def error(self, message):
             self.print_help()
@@ -69,7 +69,6 @@ def parseArgs():
     groupData = parser.add_argument_group('Dataset source')
     groupData.add_argument('--bag', dest='bagfile', nargs=1, help='Ros bag file containing image and imu data (rostopics specified in the yamls)', action=Once, required=True)
     groupData.add_argument('--bag-from-to', metavar='bag_from_to', type=float, nargs=2, help='Use the bag data starting from up to this time [s]')
-    groupData.add_argument('--bag-freq', metavar='bag_freq', type=float, help='Frequency to extract features at [hz]')
     groupData.add_argument('--perform-synchronization',  action='store_true', dest='perform_synchronization', \
                           help='Perform a clock synchronization according to \'Clock synchronization algorithms for network measurements\' by Zhang et al. (2002).')
     
@@ -79,15 +78,20 @@ def parseArgs():
     groupCam.add_argument('--recompute-camera-chain-extrinsics',  action='store_true', dest='recompute_chain_extrinsics', \
                           help='Recompute the camera chain extrinsics. This option is exclusively recommended for debugging purposes in order to identify problems with the camera chain extrinsics.')
     groupCam.add_argument('--reprojection-sigma', type=float, default=1.0, dest='reprojection_sigma', help='Standard deviation of the distribution of reprojected corner points [px]. (default: %(default)s)', required=False)
-    
+    groupCam.add_argument('--estimate-intrinsics', action='store_true', dest='estimate_intrinsics', help='Enable the intrinsics calibration', required=False)
+    groupCam.add_argument('--estimate-distortion', action='store_true', dest='estimate_distortion', help='Enable the distortion calibration', required=False)
+    groupCam.add_argument('--estimate-line-delay', action='store_true', dest='estimate_line_delay',
+                          help='Enable the line delay calibration', required=False)
+
     groupImu = parser.add_argument_group('IMU configuration')
     groupImu.add_argument('--imu', dest='imu_yamls', nargs='+', help='Yaml files holding the IMU noise parameters. The first IMU will be the reference IMU.', required=True, action=Once)
     groupImu.add_argument('--imu-delay-by-correlation', action='store_true', dest='estimate_imu_delay', \
                           help='Estimate the delay between multiple IMUs by correlation. By default, no temporal calibration between IMUs will be performed.', required=False)      
     groupImu.add_argument('--imu-models', nargs='+', dest='imu_models', help='The IMU models to estimate. Currently supported are \'calibrated\', \'scale-misalignment\' and \'scale-misalignment-size-effect\'.', action=Once)
-    
+    groupImu.add_argument('--constant_bias', action='store_true', help="bias is constant or time-varying")
+
     groupTarget = parser.add_argument_group('Calibration target')
-    groupTarget.add_argument('--target', dest='target_yaml', help='Calibration target configuration as yaml file', required=True, action=Once)
+    groupTarget.add_argument('--target', dest='target_yaml', help='Calibration target configuration as yaml file', action=Once)
     
     #optimization options
     groupOpt = parser.add_argument_group('Optimization options')
@@ -95,6 +99,15 @@ def parseArgs():
     groupOpt.add_argument('--max-iter', type=int, default=30, dest='max_iter', help='Max. iterations (default: %(default)s)', required=False)
     groupOpt.add_argument('--recover-covariance', action='store_true', dest='recover_cov', help='Recover the covariance of the design variables.', required=False)
     groupOpt.add_argument('--timeoffset-padding', type=float, default=30.e-3, dest='timeoffset_padding', help='Maximum range in which the timeoffset may change during estimation [s] (default: %(default)s)', required=False)
+    groupOpt.add_argument('--timeoffset-pattern', type=float, default=30.e-3, dest='timeoffset_pattern',
+                          help='A time offset to pad the blocks generated in the hessian/jacobian to ensure'
+                               ' a constant symbolic representation of the batch estimation problem, even when a change'
+                               ' in the shutter timing shifts the capture time to another spline segment.')
+    groupOpt.add_argument('--pose_knots_per_second', type=int, default=100,
+                          help='Pose knots per second (default: %(default)s)')
+    groupOpt.add_argument('--bias_knots_per_second', type=int, default=50,
+                          help='Bias knots per second (default: %(default)s). '
+                               'This value will be ignored if constant_bias is set.')
 
     #Result options  
     outputSettings = parser.add_argument_group('Output options')
@@ -102,13 +115,24 @@ def parseArgs():
     outputSettings.add_argument('--extraction-stepping', action='store_true', dest='extractionstepping', help='Show each image during calibration target extraction  (disables plots)', required=False)
     outputSettings.add_argument('--verbose', action='store_true', dest='verbose', help='Verbose output (disables plots)')
     outputSettings.add_argument('--dont-show-report', action='store_true', dest='dontShowReport', help='Do not show the report on screen after calibration.')
-    outputSettings.add_argument('--export-poses', action='store_true', dest='exportPoses', help='Export the optimized poses into a CSV (time_ns, position, quaterion)')
+     
+    outputSettings.add_argument('--export-poses', action='store_true', dest='exportPoses', help='Also export the optimized poses.')
 
+    outputSettings.add_argument('--save-splines', action='store_true', dest='saveSplines',
+                                help='save the pose and IMU bias splines after calibration.')
+    outputSettings.add_argument('--saveVimap', action='store_true',
+                                help='save extracted camera measurements and IMU data in maplab csv format.')
+    outputSettings.add_argument('--identifyNoises', action='store_true',
+                                help='compute residual statistics after calibration.')
+    return parser
+
+
+def parseArgs(parser):
     #print help if no argument is specified
     if len(sys.argv)==1:
         parser.print_help()
         sys.exit(2)
-    
+
     #Parser the argument list
     try:
         parsed = parser.parse_args()
@@ -125,10 +149,16 @@ def parseArgs():
     
     return parsed
 
+
 def main():
     # Parse the arguments
-    parsed = parseArgs();
-    
+    parser = createParser()
+    parsed = parseArgs(parser)
+
+    calibrate_imu_camera(parsed)
+
+
+def calibrate_imu_camera(parsed):
     #logging modess
     if parsed.verbose:
         sm.setLoggingLevel(sm.LoggingLevel.Debug)
@@ -136,7 +166,11 @@ def main():
         sm.setLoggingLevel(sm.LoggingLevel.Info)
         
     signal.signal(signal.SIGINT, signal_exit)
-            
+
+    dash = '-' * 80
+    print(dash)
+    print("IMU camera calibration starts.")
+
     print("Initializing IMUs:")
     if  len(parsed.imu_yamls) == 1 and not parsed.imu_models:
         #Maintain backwards compatibility with previous interface.
@@ -146,35 +180,43 @@ def main():
         sys.exit(2)
     
     imus = list()
-    for i, (imu_yaml, imu_model) in enumerate(zip(parsed.imu_yamls, parsed.imu_models)):
+    for (imu_yaml, imu_model) in zip(parsed.imu_yamls, parsed.imu_models):
         imuConfig = kc.ImuParameters(imu_yaml)
         imuConfig.printDetails()
         if imu_model == 'calibrated':
             imus.append( sens.IccImu(imuConfig, parsed, isReferenceImu=(not imus), \
-                         estimateTimedelay=parsed.estimate_imu_delay, imuNr=i) )
+                         estimateTimedelay=parsed.estimate_imu_delay) )
         elif imu_model == 'scale-misalignment':
             imus.append( sens.IccScaledMisalignedImu(imuConfig, parsed, isReferenceImu=(not imus), \
-                         estimateTimedelay=parsed.estimate_imu_delay, imuNr=i) )
+                         estimateTimedelay=parsed.estimate_imu_delay) )
         elif imu_model == 'scale-misalignment-size-effect':
             imus.append( sens.IccScaledMisalignedSizeEffectImu(imuConfig, parsed, isReferenceImu=(not imus), \
-                         estimateTimedelay=parsed.estimate_imu_delay, imuNr=i) )
+                         estimateTimedelay=parsed.estimate_imu_delay) )
         else:
             sm.logError("Model {0} is currently unsupported.".format(imu_model))
             sys.exit(2)
-    
-    #load calibration target configuration 
-    targetConfig = kc.CalibrationTargetParameters(parsed.target_yaml)
-       
-    print("Initializing calibration target:")
-    targetConfig.printDetails()
+
+    if parsed.target_yaml:
+        #load calibration target configuration
+        targetConfig = kc.CalibrationTargetParameters(parsed.target_yaml)
+
+        print("Initializing calibration target:")
+        targetConfig.printDetails()
+    else:
+        targetConfig = None
     
     print("Initializing camera chain:")
     chain = kc.CameraChainParameters(parsed.chain_yaml)      
     chain.printDetails()   
     camChain = sens.IccCameraChain(chain, targetConfig, parsed)
-
+    config = IccCalibratorConfiguration()
+    config.estimateParameters['timeOffset'] = not parsed.no_time
+    config.estimateParameters['chainExtrinsics'] = parsed.recompute_chain_extrinsics
+    config.estimateParameters['shutter'] = parsed.estimate_line_delay
+    config.estimateParameters['intrinsics'] = parsed.estimate_intrinsics
+    config.estimateParameters['distortion'] = parsed.estimate_distortion
     #create a calibrator instance
-    iCal = IccCalibrator()
+    iCal = IccCalibrator(config)
 
     #register sensors with calibrator
     iCal.registerCamChain(camChain)
@@ -186,19 +228,20 @@ def main():
     print("")
     print("Building the problem")
     iCal.buildProblem(splineOrder=6, 
-                      poseKnotsPerSecond=100, 
-                      biasKnotsPerSecond=50, 
+                      poseKnotsPerSecond=parsed.pose_knots_per_second,
+                      biasKnotsPerSecond=parsed.bias_knots_per_second,
                       doPoseMotionError=False,
-                      doBiasMotionError=True,
+                      doBiasMotionError=not parsed.constant_bias,
                       blakeZisserCam=-1,
                       huberAccel=-1,
                       huberGyro=-1,
-                      noTimeCalibration=parsed.no_time,
-                      noChainExtrinsics=(not parsed.recompute_chain_extrinsics),
                       maxIterations=parsed.max_iter,
                       timeOffsetPadding=parsed.timeoffset_padding,
+                      timeOffsetConstantSparsityPattern=parsed.timeoffset_pattern,
                       verbose = parsed.verbose)
 
+    if parsed.saveVimap:
+        kc.VimapCsvWriter.saveVimap(iCal, "")
     print("")
     print("Before Optimization")
     print("===================")
@@ -213,35 +256,48 @@ def main():
     print("==================")
     util.printErrorStatistics(iCal)
     util.printResults(iCal, withCov=parsed.recover_cov)
-    print("")
 
-    bagtag = os.path.splitext(parsed.bagfile[0])[0]
-    yamlFilename = bagtag + "-camchain-imucam.yaml"
+    print("")
+    try:
+        regulartag = parsed.bagfile[0].translate({ord(c):None for c in "<>:/\|?*"})
+    except TypeError:
+        regulartag = parsed.bagfile[0].translate(None, "<>:/\|?*")
+    bagtag = regulartag.replace('.bag', '', 1)
+    yamlFilename = "camchain-imucam-" + bagtag + ".yaml"
     iCal.saveCamChainParametersYaml(yamlFilename)
-    print("Results written to:")
     print("  Saving camera chain calibration to file: {0}".format(yamlFilename))
 
-    yamlFilename = bagtag + "-imu.yaml"
+    print("")
+    yamlFilename = "imu-" + bagtag + ".yaml"
     iCal.saveImuSetParametersYaml(yamlFilename)
     print("  Saving imu calibration to file: {0}".format(yamlFilename))
 
-    resultFileTxt = bagtag + "-results-imucam.txt"
+    resultFileTxt = "results-imucam-" + bagtag + ".txt"
     util.saveResultTxt(iCal, filename=resultFileTxt)
     print("  Detailed results written to file: {0}".format(resultFileTxt))
-
-    print("")
-    print("Generating result report...")
-    reportFile = bagtag + "-report-imucam.pdf"
+    
+    print("Generating result report...")    
+    reportFile = "report-imucam-" + bagtag + ".pdf"
     util.generateReport(iCal, filename=reportFile, showOnScreen=not parsed.dontShowReport)
     print("  Report written to {0}".format(reportFile))
     print("")
-
+    
     if parsed.exportPoses:
         print("Exporting poses...")
-        posesFile = bagtag + "-poses-imucam-imu0.csv"
+        posesFile = "poses-imucam-imu0-" + bagtag + ".csv"
         util.exportPoses(iCal, filename=posesFile)
-        print("  Poses written to {0}".format(posesFile))
+        print("Poses written to {0}".format(posesFile))
         print("")
+
+    if parsed.saveSplines:
+        print("Saving fitted B splines...")
+        BSplineIO.saveBSpline(iCal, "")
+
+    residualStats = dict()
+    if parsed.identifyNoises:
+        residualStats = iCal.computeResidualStatistics()
+    return residualStats
+
 
 if __name__ == "__main__":
     main()

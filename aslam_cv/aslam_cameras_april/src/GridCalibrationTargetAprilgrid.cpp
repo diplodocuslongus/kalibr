@@ -57,9 +57,7 @@ void GridCalibrationTargetAprilgrid::initialize()
 {
   if (_options.showExtractionVideo) {
     cv::namedWindow("Aprilgrid: Tag detection", cv::WINDOW_NORMAL);
-    cv::resizeWindow("Aprilgrid: Tag detection", 640, 480);
     cv::namedWindow("Aprilgrid: Tag corners", cv::WINDOW_NORMAL);
-    cv::resizeWindow("Aprilgrid: Tag corners", 640, 480);
   }
 
   //create the tag detector
@@ -172,7 +170,7 @@ bool GridCalibrationTargetAprilgrid::computeObservation(
         cv::cvtColor(imageCopy, imageCopy, cv::COLOR_GRAY2RGB);
 
         //mark all duplicate tags in image
-        for (int j = 0; j < detections.size() - 1; j++) {
+        for (int j = 0; i < detections.size() - 1; i++) {
           if (detections[j].id == detections[j + 1].id) {
             detections[j].draw(imageCopy);
             detections[j + 1].draw(imageCopy);

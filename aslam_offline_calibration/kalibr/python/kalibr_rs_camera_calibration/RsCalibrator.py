@@ -1,4 +1,7 @@
 #encoding:UTF-8
+from __future__ import print_function
+import time
+
 import sm
 import aslam_backend as aopt
 import aslam_cv_backend as acvb
@@ -7,9 +10,9 @@ import aslam_splines as asp
 import incremental_calibration as inc
 from kalibr_common import ConfigReader as cr
 import bsplines
+import kalibr_common as kc
 import numpy as np
 import multiprocessing
-import os
 import sys
 import gc
 import math
@@ -18,12 +21,16 @@ from .RsPlot import plotSpline
 from .RsPlot import plotSplineValues
 import pylab as pl
 import pdb
+from kalibr_imu_camera_calibration import BSplineIO
+from kalibr_imu_camera_calibration import IccSensors as sens
 
 # make numpy print prettier
 np.set_printoptions(suppress=True)
 
 CALIBRATION_GROUP_ID = 0
+TRANSFORMATION_GROUP_ID = 1
 LANDMARK_GROUP_ID = 2
+HELPER_GROUP_ID = 3
 
 class RsCalibratorConfiguration(object):
     deltaX = 1e-8
@@ -53,7 +60,8 @@ class RsCalibratorConfiguration(object):
     inverseFeatureCovariance = 1/0.26
     """The inverse covariance of the feature detector. Used to standardize the error terms."""
 
-    estimateParameters = {'shutter': True, 'intrinsics': True, 'distortion': True, 'pose': True, 'landmarks': False}
+    estimateParameters = {'shutter': True, 'intrinsics': True, 'distortion': True,
+                          'timeOffset': False, 'pose': True, 'landmarks': False}
     """Which parameters to estimate. Dictionary with shutter, intrinsics, distortion, pose, landmarks as bool"""
 
     splineOrder = 4
@@ -75,12 +83,30 @@ class RsCalibratorConfiguration(object):
     knot placement and for initializing a knot sequence if no number of knots is given.
     """
 
+    chain_yaml = None
+    """Camera system configuration yaml. If provided, it will be used to initialize the camera projection and distortion parameters!"""
+
+    saveSamplePoses = False
+
+    reprojectFrameIndex = 0
+
+    recoverCov = False
+
     def validate(self, isRollingShutter):
         """Validate the configuration."""
         # only rolling shutters can be estimated
         if (not isRollingShutter):
             self.estimateParameters['shutter'] = False
             self.adaptiveKnotPlacement = False
+
+
+class ImuDataDescription(object):
+    def __init__(self, bagfiles, bag_from_to, perform_sync, constant_bias):
+        self.bagfile = bagfiles
+        self.bag_from_to = bag_from_to
+        self.perform_synchronization = perform_sync
+        self.constant_bias = constant_bias
+
 
 class RsCalibrator(object):
 
@@ -114,6 +140,12 @@ class RsCalibrator(object):
     __reprojection_errors = []
     """Reprojection errors of the latest optimizer iteration"""
 
+    __std_camera = None
+
+    __ImuList = None
+
+    __imageHeight = 0
+
     def calibrate(self,
         cameraGeometry,
         observations,
@@ -139,7 +171,6 @@ class RsCalibrator(object):
         self.__camera_dv = cameraGeometry.dv
         self.__camera = cameraGeometry.geometry
         self.__config = config
-
         self.__config.validate(self.__isRollingShutter())
 
         # obtain initial guesses for extrinsics and intrinsics
@@ -152,6 +183,11 @@ class RsCalibrator(object):
         # set the value for the motion prior term or uses the defaults
         W = self.__getMotionModelPriorOrDefault()
 
+        times = [observation.time().toSec() for observation in self.__observations]
+        times = np.sort(times)
+        deltaTimes = np.diff(times)
+        self.__config.framerate = 1.0 / np.median(deltaTimes)
+
         self.__poseSpline = self.__generateInitialSpline(
             self.__config.splineOrder,
             self.__config.timeOffsetPadding,
@@ -162,7 +198,7 @@ class RsCalibrator(object):
         # build estimator problem
         optimisation_problem = self.__buildOptimizationProblem(W)
 
-        self.__runOptimization(
+        status = self.__runOptimization(
             optimisation_problem,
             self.__config.deltaJ,
             self.__config.deltaX,
@@ -188,15 +224,32 @@ class RsCalibrator(object):
                 self.__poseSpline = knotUpdateStrategy.getUpdatedSpline(self.__poseSpline_dv.spline(), knots, self.__config.splineOrder)
 
                 optimisation_problem = self.__buildOptimizationProblem(W)
-                self.__runOptimization(
+                status = self.__runOptimization(
                     optimisation_problem,
                     self.__config.deltaJ,
                     self.__config.deltaX,
                     self.__config.maxNumberOfIterations
                 )
 
+        if self.__config.saveSamplePoses:
+            self.__saveBSplinePoses()
+
         self.__printResults()
         self.__saveParametersYaml()
+        if status and self.__config.recoverCov:
+            self.recoverCovariance(optimisation_problem)
+
+    def __saveBSplinePoses(self):
+            bspline = self.__poseSpline_dv.spline()
+            rate = 100
+            interval = 1.0 / rate
+            padding = 2
+            samplePoseTimes = np.arange(bspline.t_min() + padding, bspline.t_max() - padding, interval)
+            refPoseStream = open("sampled_poses.txt", 'w')
+            print("%poses {} Hz from the RS calibrator B-splines: time (sec), T_w_c (txyz, qxyzw).".format(rate), file=refPoseStream)
+            BSplineIO.sampleAndSaveBSplinePoses(samplePoseTimes, self.__poseSpline_dv, stream=refPoseStream)
+            refPoseStream.close()
+
 
     def __generateExtrinsicsInitialGuess(self):
         """Estimate the pose of the camera with a PnP solver. Call after initializing the intrinsics"""
@@ -215,11 +268,24 @@ class RsCalibrator(object):
         Get an initial guess for the camera geometry (intrinsics, distortion). Distortion is typically left as 0,0,0,0.
         The parameters of the geometryModel are updated in place.
         """
-        if (self.__isRollingShutter()):
-            sensorRows = self.__observations[0].imRows()
-            self.__camera.shutter().setParameters(np.array([1.0 / self.__config.framerate / float(sensorRows)]))
-
-        return self.__camera.initializeIntrinsics(self.__observations)
+        if self.__config.chain_yaml:
+            camchain = kc.CameraChainParameters(self.__config.chain_yaml)
+            camConfig = camchain.getCameraParameters(0)
+            aslamCamera = kc.AslamCamera.fromParameters(camConfig)
+            resolution = camConfig.getResolution()
+            self.__imageHeight = resolution[1]
+            self.__camera = aslamCamera.geometry
+            self.__camera_dv = self.__cameraModelFactory.designVariable(self.__camera)
+            status = True
+            print('External projection and distortion parameters {}'.format(
+                self.__camera.getParameters(True, True, True).T))
+        else:
+            if self.__isRollingShutter():
+                self.__imageHeight = self.__observations[0].imRows()
+                self.__camera.shutter().setParameters(np.array([1.0 / self.__config.framerate / float(sensorRows)]))
+            status = self.__camera.initializeIntrinsics(self.__observations)
+            print('Initial projection and distortion parameters {}'.format(self.__camera.getParameters(True, True, True).T))
+        return status
 
     def __getMotionModelPriorOrDefault(self):
         """Get the motion model prior or the default value"""
@@ -258,10 +324,73 @@ class RsCalibrator(object):
             knots = int(round(seconds * framerate/3))
 
         print("")
-        print("Initializing a pose spline with %d knots (%f knots per second over %f seconds)" % ( knots, 100, seconds))
+        print("Initializing a pose spline with %d knots (%f knots per second over %f seconds)" % ( knots, knots/seconds, seconds))
         poseSpline.initPoseSplineSparse(times, curve, knots, 1e-4)
-
         return poseSpline
+
+
+    def loadImu(self, imu_yaml, imu_model, imuDescription):
+        if imu_yaml is None:
+            self.__ImuList = None
+            return
+        imus = list()
+        imuConfig = kc.ImuParameters(imu_yaml)
+        imuConfig.printDetails()
+
+        if imu_model != "calibrated":
+            raise Exception("Only calibrated IMU model is supported for simplicity!")
+        imus.append(sens.IccImu(imuConfig, imuDescription, isReferenceImu=True, estimateTimedelay=False))
+        self.__ImuList = imus
+
+
+    def __addImuErrors(self, problem):
+        poseSpline = self.__poseSpline_dv.spline()
+        for imu in self.__ImuList:
+            splineOrder = 4
+            biasKnotsPerSecond = 5
+            imu.initBiasSplines(poseSpline, splineOrder, biasKnotsPerSecond)
+
+        # estimate gravity in the world coordinate frame as the mean specific force.
+        R_i_c = np.identity(3)
+        if self.__config.chain_yaml:
+            camchain = kc.CameraChainParameters(self.__config.chain_yaml)
+            T_cam_imu = camchain.getExtrinsicsImuToCam(0)
+            T_imu_cam = T_cam_imu.inverse()
+            R_i_c = sm.quat2r(T_imu_cam.q())
+
+        a_w = []
+        for im in self.__ImuList[0].imuData:
+            tk = im.stamp.toSec()
+            if tk > poseSpline.t_min() and tk < poseSpline.t_max():
+                a_w.append(np.dot(poseSpline.orientation(tk), np.dot(R_i_c, - im.alpha)))
+        if len(a_w) == 0:
+            print("poseSpline t_min {}, t_max {}.".format(poseSpline.t_min(), poseSpline.t_max()))
+            print("IMU data t_min {}, t_max {}.".format(self.__ImuList[0].imuData[0].stamp.toSec(),
+                                                        self.__ImuList[0].imuData[-1].stamp.toSec()))
+            raise IOError('No corresponding IMU data were found.')
+        
+        mean_a_w = np.mean(np.asarray(a_w).T, axis=1)
+        # A rough gravity magnitude is OK for RS camera calibration with loose IMU constraints.
+        gravity_w = mean_a_w / np.linalg.norm(mean_a_w) * 9.80655
+        print("Gravity was intialized to {} [m/s^2]".format(gravity_w))
+
+        # Add the calibration target orientation design variable. (expressed as gravity vector in target frame)
+        self.gravityDv = aopt.EuclideanDirection(gravity_w)
+        self.gravityExpression = self.gravityDv.toExpression()
+        self.gravityDv.setActive(True)
+        problem.addDesignVariable(self.gravityDv, HELPER_GROUP_ID)
+
+        for imu in self.__ImuList:
+            imu.addDesignVariables(problem)
+
+        huberAccel = -1
+        huberGyro = -1
+        gyroNoiseScale = 1.0
+        accelNoiseScale = 1.0
+        for imu in self.__ImuList:
+            imu.addAccelerometerErrorTerms(problem, self.__poseSpline_dv, self.gravityExpression, mSigma=huberAccel, accelNoiseScale=accelNoiseScale)
+            imu.addGyroscopeErrorTerms(problem, self.__poseSpline_dv, mSigma=huberGyro, gyroNoiseScale=gyroNoiseScale, g_w=self.gravityExpression)
+            imu.addBiasMotionTerms(problem)
 
     def __buildOptimizationProblem(self, W):
         """Build the optimisation problem"""
@@ -285,9 +414,8 @@ class RsCalibrator(object):
         landmarks = []
         landmarks_expr = []
         target = self.__cameraGeometry.ctarget.detector.target()
-        for idx in range(0, target.size()):
-            # design variable for landmark
-            landmark_w_dv = aopt.HomogeneousPointDv(sm.toHomogeneous(target.point(idx)))
+        for i in range(0, target.size()):
+            landmark_w_dv = aopt.HomogeneousPointDv(sm.toHomogeneous(target.point(i)))
             landmark_w_dv.setActive(self.__config.estimateParameters['landmarks'])
             landmarks.append(landmark_w_dv)
             landmarks_expr.append(landmark_w_dv.toExpression())
@@ -311,14 +439,26 @@ class RsCalibrator(object):
 
         #####
         # Regularization term / motion prior
+        if self.__ImuList:
+            self.__addImuErrors(problem)
+            W *= 1e-2
+        # Add the time delay design variable.
+        self.cameraTimeToImuTimeDv = aopt.Scalar(0.0)
+        self.cameraTimeToImuTimeDv.setActive(self.__config.estimateParameters['timeOffset'])
+        problem.addDesignVariable(self.cameraTimeToImuTimeDv, CALIBRATION_GROUP_ID)
+
+
         motionError = asp.BSplineMotionError(self.__poseSpline_dv, W)
         problem.addErrorTerm(motionError)
+
+        dummyPoint = np.array([0, self.__imageHeight / 2])
+        centerRowTemporalOffset = self.__camera_dv.temporalOffset(dummyPoint)
 
         #####
         # add a reprojection error for every corner of each observation
         for observation in self.__observations:
             # only process successful observations of a pattern
-            if observation.hasSuccessfulObservation():
+            if (observation.hasSuccessfulObservation()):
                 # add a frame
                 frame = self.__cameraModelFactory.frameType()
                 frame.setGeometry(self.__camera)
@@ -327,11 +467,11 @@ class RsCalibrator(object):
 
                 #####
                 # add an error term for every observed corner
-                corner_ids = observation.getCornersIdx()
+                corner_id_list = observation.getCornersIdx()
                 for index, point in enumerate(observation.getCornersImageFrame()):
-
                     # keypoint time offset by line delay as expression type
-                    keypoint_time = self.__camera_dv.keypointTime(frame.time(), point)
+                    keypoint_time = self.cameraTimeToImuTimeDv.toExpression() + \
+                                    self.__camera_dv.keypointTime(frame.time(), point) - centerRowTemporalOffset
 
                     # from target to world transformation.
                     T_w_t = self.__poseSpline_dv.transformationAtTime(
@@ -342,10 +482,9 @@ class RsCalibrator(object):
                     T_t_w = T_w_t.inverse()
 
                     # transform target point to camera frame
-                    p_t = T_t_w * landmarks_expr[corner_ids[index]]
+                    p_t = T_t_w * landmarks_expr[corner_id_list[index]]
 
                     # create the keypoint
-                    keypoint_index = frame.numKeypoints()
                     keypoint = acv.Keypoint2()
                     keypoint.setMeasurement(point)
                     inverseFeatureCovariance = self.__config.inverseFeatureCovariance
@@ -355,7 +494,7 @@ class RsCalibrator(object):
                     # create reprojection error
                     reprojection_error = self.__buildErrorTerm(
                         frame,
-                        keypoint_index,
+                        index,
                         p_t,
                         self.__camera_dv,
                         self.__poseSpline_dv
@@ -364,6 +503,91 @@ class RsCalibrator(object):
                     problem.addErrorTerm(reprojection_error)
 
         return problem
+
+    def getReprojectedCorners(self, frameIndex):
+        """
+        Reproject detected corners of a frame with the RS and the GS.
+        :param frameIndex: the index of fhe image frame within the used images for reprojection.
+        :return: A NX6 array. Each row corresponds to an observed landmark,
+        The columns correspond to reprojected RS point, reprojected GS point, and the detected corner.
+        """
+        observation = self.__observations[frameIndex]
+        print("Reprojecting corners for frame {} at time {}.".format(frameIndex, observation.time().toSec()))
+        imageCornerPoints = np.array(observation.getCornersImageFrame())  # Nx2
+
+        # Rolling shutter projections
+        # add all the landmarks once
+        landmarks = []
+        landmarks_expr = []
+        target = self.__cameraGeometry.ctarget.detector.target()
+        for i in range(0, target.size()):
+            landmark_w_dv = aopt.HomogeneousPointDv(sm.toHomogeneous(target.point(i)))
+            landmark_w_dv.setActive(self.__config.estimateParameters['landmarks'])
+            landmarks.append(landmark_w_dv)
+            landmarks_expr.append(landmark_w_dv.toExpression())
+
+        frame = self.__cameraModelFactory.frameType()
+        frame.setGeometry(self.__camera)
+        frame.setTime(observation.time())
+        # build an error term for every observed corner
+        corner_id_list = observation.getCornersIdx()
+        predictedMeasurements = list()
+        for index, point in enumerate(observation.getCornersImageFrame()):
+            # keypoint time offset by line delay as expression type
+            keypoint_time = self.__camera_dv.keypointTime(frame.time(), point)
+
+            # from target to world transformation.
+            T_w_t = self.__poseSpline_dv.transformationAtTime(
+                keypoint_time,
+                self.__config.timeOffsetConstantSparsityPattern,
+                self.__config.timeOffsetConstantSparsityPattern
+            )
+            T_t_w = T_w_t.inverse()
+
+            # transform target point to camera frame
+            p_t = T_t_w * landmarks_expr[corner_id_list[index]]
+
+            # create the keypoint
+            keypoint_index = frame.numKeypoints()
+            keypoint = acv.Keypoint2()
+            keypoint.setMeasurement(point)
+            inverseFeatureCovariance = self.__config.inverseFeatureCovariance
+            keypoint.setInverseMeasurementCovariance(np.eye(len(point)) * inverseFeatureCovariance)
+            frame.addKeypoint(keypoint)
+
+            rerr = self.__cameraModelFactory.reprojectionError(frame, keypoint_index, p_t, self.__camera_dv)
+            rerr.evaluateError()
+            predictedMeas = imageCornerPoints[index, :].T - rerr.error()
+            predictedMeasurements.append(predictedMeas)
+        rsImageCornerProjected = np.array(predictedMeasurements)  # NX2
+
+        # Global shutter projections
+        # Build a transformation expression for the time.
+        cameraTimeToImuTimeDv = aopt.Scalar(0.0)
+
+        proj = self.__camera_dv.projectionDesignVariable().value()
+        sensorRows = proj.rv()
+        halfSensorRows = sensorRows / 2
+
+        lineDelay = self.__camera_dv.shutterDesignVariable().value().lineDelay()
+        frameTime = cameraTimeToImuTimeDv.toExpression() + observation.time().toSec() + halfSensorRows * lineDelay
+        frameTimeScalar = frameTime.toScalar()
+        # as we are applying an initial time shift outside the optimization so
+        # we need to make sure that we dont add data outside the spline definition
+        if frameTimeScalar <= self.__poseSpline_dv.spline().t_min() or frameTimeScalar >= self.__poseSpline_dv.spline().t_max():
+            return np.array([])
+
+        T_w_c = self.__poseSpline_dv.transformationAtTime(
+            frameTime,
+            self.__config.timeOffsetConstantSparsityPattern,
+            self.__config.timeOffsetConstantSparsityPattern
+        )
+        # Simple approach to reproject landmarks with float numbers.
+        observation.set_T_t_c(sm.Transformation(T_w_c.toTransformationMatrix()))
+        gsImageCornerProjected = np.array(observation.getCornerReprojection(self.__camera))  # Nx2
+        if gsImageCornerProjected.shape[0] == 0: # when simulated observations are used, the GS corners can be empty.
+            return np.concatenate((rsImageCornerProjected, imageCornerPoints), axis=1)
+        return np.concatenate((rsImageCornerProjected, gsImageCornerProjected, imageCornerPoints), axis=1)
 
     def __buildErrorTerm(self, frame, keypoint_index, p_t, camera_dv, poseSpline_dv):
         """
@@ -416,7 +640,7 @@ class RsCalibrator(object):
         for i in range(0, self.__poseSpline_dv.numDesignVariables()):
             dv = self.__poseSpline_dv.designVariable(i)
             dv.setActive(self.__config.estimateParameters['pose'])
-            problem.addDesignVariable(dv, CALIBRATION_GROUP_ID)
+            problem.addDesignVariable(dv, TRANSFORMATION_GROUP_ID)
 
     def __runOptimization(self, problem ,deltaJ, deltaX, maxIt):
         """Run the given optimization problem problem"""
@@ -427,9 +651,8 @@ class RsCalibrator(object):
         # verbose and choldmod solving with schur complement trick
         options = aopt.Optimizer2Options()
         options.verbose = True
-        options.nThreads = max(1,multiprocessing.cpu_count()-1)
+        options.linearSolver = aopt.BlockCholeskyLinearSystemSolver()
         options.doSchurComplement = True
-        options.linearSolver = aopt.BlockCholeskyLinearSystemSolver()  #does not have multi-threading support
 
         # stopping criteria
         options.maxIterations = maxIt
@@ -444,7 +667,38 @@ class RsCalibrator(object):
         optimizer.setProblem(problem)
 
         # go for it:
-        return optimizer.optimize()
+        status = optimizer.optimize()
+        if status:
+            corners = self.getReprojectedCorners(self.__config.reprojectFrameIndex)
+            np.savetxt("reprojected_corners_{}.txt".format(self.__config.reprojectFrameIndex), corners)
+
+        return status
+
+    def recoverCovariance(self, problem):
+        """Computing covariance takes so long because of the complex prior BSplineMotionError"""
+        #Covariance ordering (=dv ordering)
+        #ORDERING:   N=num cams
+        #            camera -->  sum(sub) * N
+        #                a) shutter    --> 1
+        #                b) projection --> omni:5, pinhole: 4
+        #                c) distortion --> 4
+        tic = time.time()
+        estimator = inc.IncrementalEstimator(CALIBRATION_GROUP_ID)
+        rval = estimator.addBatch(problem, True)
+        est_stds = np.sqrt(estimator.getSigma2Theta().diagonal())
+        toc = time.time()
+        elapsed = toc - tic
+        print("Covariance recovery takes {} secs".format(elapsed))
+        #split and store the variance
+        std_camera = list()
+        offset=0
+        nt = self.__camera.geometry.minimalDimensionsShutter() +  \
+            self.__camera.geometry.minimalDimensionsProjection() +  \
+            self.__camera.geometry.minimalDimensionsDistortion()      
+        std_camera.extend(est_stds[offset:offset+nt].flatten().tolist())
+        offset = offset+nt
+        self.__std_camera = std_camera
+        print('std_camera: {}'.format(std_camera))
 
     def __isRollingShutter(self):
         return self.__cameraModelFactory.shutterType == acv.RollingShutter
@@ -453,19 +707,32 @@ class RsCalibrator(object):
         shutter = self.__camera_dv.shutterDesignVariable().value()
         proj = self.__camera_dv.projectionDesignVariable().value()
         dist = self.__camera_dv.distortionDesignVariable().value()
+        dt = self.cameraTimeToImuTimeDv.toScalar()
         print("")
-        if (self.__isRollingShutter()):
-            print("LineDelay:")
-            print(shutter.lineDelay())
-        print("Intrinsics:")
-        print(proj.getParameters().flatten())
-        print("Distortion:")
-        print(dist.getParameters().flatten())
+        if not self.__std_camera:
+            if (self.__isRollingShutter()):
+                print("LineDelay: {}".format(shutter.lineDelay()))
+            p = proj.getParameters().flatten()
+            print("Intrinsics: {}".format(p))
+            d = dist.getParameters().flatten()
+            print("Distortion: {}".format(d))
+        else:
+            if (self.__isRollingShutter()):
+                print("LineDelay: {} +/- {}".format(shutter.lineDelay(), self.__std_camera[0]))
+            p = proj.getParameters().flatten()
+            print("Intrinsics: {} +/- {}".format(p, self.__std_camera[1:1+p.shape[0]]))
+            d = dist.getParameters().flatten()
+            print("Distortion: {} +/- {}".format(d, self.__std_camera[1+p.shape[0]:]))
+        print("timeshift_cam_imu: {}".format(dt))
 
     def __saveParametersYaml(self):
         # Create new config file
-        bagtag = os.path.splitext(self.__cameraGeometry.dataset.bagfile)[0]
-        resultFile = bagtag + "-camchain.yaml"
+        try:
+            regulartag = self.__cameraGeometry.dataset.bagfile.translate({ord(c):None for c in "<>:/\|?*"})
+        except TypeError:
+            regulartag = self.__cameraGeometry.dataset.bagfile.translate(None, "<>:/\|?*")
+        bagtag = regulartag.replace('.bag', '', 1)
+        resultFile = "camchain-" + bagtag + ".yaml"
         chain = cr.CameraChainParameters(resultFile, createYaml=True)
         camParams = cr.CameraParameters(resultFile, createYaml=True)
         camParams.setRosTopic(self.__cameraGeometry.dataset.topic)

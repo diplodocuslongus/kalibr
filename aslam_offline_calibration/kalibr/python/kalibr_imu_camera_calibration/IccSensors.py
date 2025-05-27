@@ -1,4 +1,4 @@
-from __future__ import print_function #handle print in 2.x python
+from __future__ import print_function
 import sm
 import aslam_cv as acv
 import aslam_cameras_april as acv_april
@@ -8,7 +8,6 @@ import bsplines
 import kalibr_common as kc
 import kalibr_errorterms as ket
 from . import IccCalibrator as ic
-from .IccCalibrator import *
 
 import cv2
 import sys
@@ -18,11 +17,11 @@ import pylab as pl
 import scipy.optimize
 
 
-def initCameraBagDataset(bagfile, topic, from_to, freq, perform_synchronization):
+def initCameraBagDataset(bagfile, topic, from_to=None, perform_synchronization=False):
     print("Initializing camera rosbag dataset reader:")
     print("\tDataset:          {0}".format(bagfile))
     print("\tTopic:            {0}".format(topic))
-    reader = kc.BagImageDatasetReader(bagfile, topic, bag_from_to=from_to, bag_freq=freq, \
+    reader = kc.BagImageDatasetReader(bagfile, topic, bag_from_to=from_to, \
                                       perform_synchronization=perform_synchronization)
     print("\tNumber of images: {0}".format(len(reader.index)))
     return reader
@@ -36,6 +35,17 @@ def initImuBagDataset(bagfile, topic, from_to=None, perform_synchronization=Fals
     print("\tNumber of messages: {0}".format(len(reader.index)))
     return reader
 
+def initCameraDataset(path, topic, from_to=None, perform_synchronization=False):
+    if path.endswith('.bag'):
+        return initCameraBagDataset(path, topic, from_to, perform_synchronization)
+    else:
+        return kc.VimapCsvReader(path, topic, from_to, perform_synchronization)
+
+def initImuDataset(path, topic, from_to=None, perform_synchronization=False):
+    if path.endswith('.bag'):
+        return initImuBagDataset(path, topic, from_to, perform_synchronization)
+    else:
+        return kc.VimapImuCsvReader(path, topic, from_to, perform_synchronization)
 
 #mono camera
 class IccCamera():
@@ -58,15 +68,25 @@ class IccCamera():
         
         #initialize the camera data
         self.camera = kc.AslamCamera.fromParameters( camConfig )
-        
-        #extract corners
-        self.setupCalibrationTarget( targetConfig, showExtraction=showCorners, showReproj=showReproj, imageStepping=showOneStep )
-        multithreading = not (showCorners or showReproj or showOneStep)
-        self.targetObservations = kc.extractCornersFromDataset(self.dataset, self.detector, multithreading=multithreading)
-        
+
+        self.setupCalibrationTarget(targetConfig, showExtraction=showCorners, showReproj=showReproj,
+                                    imageStepping=showOneStep)
+        if self.dataset.hasFeatureAssociations():
+            self.targetObservations = self.dataset.getFeatureAssociations()
+        else:
+            # extract corners
+            multithreading = not (showCorners or showReproj or showOneStep)
+            self.targetObservations = kc.extractCornersFromDataset(self.dataset, self.detector, multithreading=multithreading)
+        numObservations = [len(obs.getCornersImageFrame()) for obs in self.targetObservations]
+        hist, bin_edges = np.histogram(numObservations, bins=np.arange(0, 156, 12))
+        print("Histogram of detected landmarks in frames {}\nBin edges of #landmarks {}".format(hist, bin_edges))
+        self.allReprojectionErrors = []
+        self.__frames = []
         #an estimate of the gravity in the world coordinate frame  
         self.gravity_w = np.array([9.80655, 0., 0.])
-        
+        self.cameraId = -1
+        self.variable_stds = {}
+
     def setupCalibrationTarget(self, targetConfig, showExtraction=False, showReproj=False, imageStepping=False):
         
         #load the calibration target configuration
@@ -159,7 +179,7 @@ class IccCamera():
         #define the optimization 
         options = aopt.Optimizer2Options()
         options.verbose = False
-        options.linearSolver = aopt.BlockCholeskyLinearSystemSolver() #does not have multi-threading support
+        options.linearSolver = aopt.BlockCholeskyLinearSystemSolver()
         options.nThreads = 2
         options.convergenceDeltaX = 1e-4
         options.convergenceDeltaJ = 1
@@ -177,17 +197,18 @@ class IccCamera():
             sys.exit(-1)
 
         #overwrite the external rotation prior (keep the external translation prior)
-        R_i_c = q_i_c_Dv.toRotationMatrix().transpose()
-        self.T_extrinsic = sm.Transformation( sm.rt2Transform( R_i_c, self.T_extrinsic.t() ) )
+        R_c_i = q_i_c_Dv.toRotationMatrix().transpose()
+        self.T_extrinsic = sm.Transformation( sm.rt2Transform( R_c_i, self.T_extrinsic.t() ) )
 
         #estimate gravity in the world coordinate frame as the mean specific force
         a_w = []
         for im in imu.imuData:
             tk = im.stamp.toSec()
             if tk > poseSpline.t_min() and tk < poseSpline.t_max():
-                a_w.append(np.dot(poseSpline.orientation(tk), np.dot(R_i_c, - im.alpha)))
+                a_w.append(np.dot(poseSpline.orientation(tk), np.dot(R_c_i, - im.alpha)))
         mean_a_w = np.mean(np.asarray(a_w).T, axis=1)
-        self.gravity_w = mean_a_w / np.linalg.norm(mean_a_w) * 9.80655
+        gravityMag = np.linalg.norm(imu.imuConfig.getGravityInTarget())
+        self.gravity_w = mean_a_w / np.linalg.norm(mean_a_w) * gravityMag
         print("Gravity was intialized to", self.gravity_w, "[m/s^2]") 
 
         #set the gyro bias prior (if we have more than 1 cameras use recursive average)
@@ -196,8 +217,8 @@ class IccCamera():
         imu.GyroBiasPrior = (imu.GyroBiasPriorCount-1.0)/imu.GyroBiasPriorCount * imu.GyroBiasPrior + 1.0/imu.GyroBiasPriorCount*b_gyro
 
         #print result
-        print("  Orientation prior camera-imu found as: (T_i_c)")
-        print(R_i_c)
+        print("  Orientation prior camera-imu found as: (R_c_i)")
+        print(R_c_i)
         print("  Gyro bias prior found as: (b_gyro)")
         print(b_gyro)
     
@@ -275,13 +296,13 @@ class IccCamera():
         
     #initialize a pose spline using camera poses (pose spline = T_wb)
     def initPoseSplineFromCamera(self, splineOrder=6, poseKnotsPerSecond=100, timeOffsetPadding=0.02):
-        T_c_b = self.T_extrinsic.T()        
+        T_c_b = self.T_extrinsic.T()
         pose = bsplines.BSplinePose(splineOrder, sm.RotationVector() )
                 
         # Get the checkerboard times.
         times = np.array([obs.time().toSec()+self.timeshiftCamToImuPrior for obs in self.targetObservations ])                 
         curve = np.matrix([ pose.transformationToCurveValue( np.dot(obs.T_t_c().T(), T_c_b) ) for obs in self.targetObservations]).T
-        
+
         if np.isnan(curve).any():
             raise RuntimeError("Nans in curve values")
             sys.exit(0)
@@ -315,7 +336,7 @@ class IccCamera():
         pose.initPoseSplineSparse(times, curve, knots, 1e-4)
         return pose
     
-    def addDesignVariables(self, problem, noExtrinsics=True, noTimeCalibration=True, baselinedv_group_id=HELPER_GROUP_ID):
+    def addDesignVariables(self, problem, estimateParameters, noExtrinsics=True, baselinedv_group_id=ic.HELPER_GROUP_ID):
         # Add the calibration design variables.
         active = not noExtrinsics
         self.T_c_b_Dv = aopt.TransformationDv(self.T_extrinsic, rotationActive=active, translationActive=active)
@@ -324,10 +345,137 @@ class IccCamera():
         
         # Add the time delay design variable.
         self.cameraTimeToImuTimeDv = aopt.Scalar(0.0)
-        self.cameraTimeToImuTimeDv.setActive( not noTimeCalibration )
-        problem.addDesignVariable(self.cameraTimeToImuTimeDv, CALIBRATION_GROUP_ID)
-        
-    def addCameraErrorTerms(self, problem, poseSplineDv, T_cN_b, blakeZissermanDf=0.0, timeOffsetPadding=0.0):
+        self.cameraTimeToImuTimeDv.setActive(estimateParameters['timeOffset'])
+        problem.addDesignVariable(self.cameraTimeToImuTimeDv, ic.CALIBRATION_GROUP_ID)
+
+        self.camera.dv.setActive(
+            estimateParameters['intrinsics'],
+            estimateParameters['distortion'],
+            self.isRollingShutter() and estimateParameters['shutter'])
+        # add the camera design variables last for optimal sparsity patterns.
+        problem.addDesignVariable(self.camera.dv.shutterDesignVariable(), ic.CALIBRATION_GROUP_ID)
+        problem.addDesignVariable(self.camera.dv.projectionDesignVariable(), ic.CALIBRATION_GROUP_ID)
+        problem.addDesignVariable(self.camera.dv.distortionDesignVariable(), ic.CALIBRATION_GROUP_ID)
+
+    def associateVariableStds(self, est_stds, cam_std_start_index, estimateParameters, cam_id):
+        variable_stds = {}
+        start_index = cam_std_start_index
+        if cam_id == 0:
+            variable_stds["q"] = est_stds[start_index : start_index + 3]
+            variable_stds["r"] = est_stds[start_index + 3 : start_index + 6]
+            start_index += 6
+        else:
+            if estimateParameters['chainExtrinsics']:
+                variable_stds["q"] = est_stds[start_index : start_index + 3]
+                variable_stds["r"] = est_stds[start_index + 3 : start_index + 6]
+                start_index += 6
+        if estimateParameters['timeOffset']:
+            variable_stds["timeOffset"] = est_stds[start_index]
+            start_index += 1
+        if estimateParameters['shutter']:
+            variable_stds["shutter"] = est_stds[start_index]
+            start_index += 1
+        if estimateParameters['intrinsics']:
+            variable_stds["intrinsics"] = \
+                est_stds[start_index : start_index + self.camera.geometry.minimalDimensionsProjection()]
+            start_index += self.camera.geometry.minimalDimensionsProjection()
+        if estimateParameters['distortion']:
+            variable_stds["distortion"] = \
+                est_stds[start_index : start_index + self.camera.geometry.minimalDimensionsDistortion()]
+            start_index += self.camera.geometry.minimalDimensionsDistortion()
+        self.cameraId = cam_id
+        self.variable_stds = variable_stds
+        return start_index - cam_std_start_index
+
+    def getResultTimeShift(self):
+        return self.cameraTimeToImuTimeDv.toScalar() + self.timeshiftCamToImuPrior
+
+    def getResultLineDelay(self):
+        if self.isRollingShutter():
+            return self.camera.dv.shutterDesignVariable().value().lineDelay()
+        else:
+            return 0
+
+    def getResultProjection(self):
+        return self.camera.dv.projectionDesignVariable().value().getParameters().flatten()
+
+    def getResultDistortion(self):
+        return self.camera.dv.distortionDesignVariable().value().getParameters().flatten()
+
+    def printResults(self, estimateParameters, cameraId, stream = sys.stdout):
+        withCov = len(self.variable_stds) > 0
+        if cameraId == 0:
+            print("T_Cam0_Imu:", file=stream)
+        else:
+            print("T_Cam{}_Cam{}".format(cameraId, cameraId - 1), file=stream)
+
+        T_cam_b = sm.Transformation(self.T_c_b_Dv.T())
+        if withCov:
+            print("\t quaternion: {} +- {}".format(T_cam_b.q(), self.variable_stds["q"]), file=stream)
+            print("\t translation: {} +- {}".format(T_cam_b.t(), self.variable_stds["r"]), file=stream)
+        else:
+            print("\t quaternion: {}".format(T_cam_b.q()), file=stream)
+            print("\t translation: {}".format(T_cam_b.t()), file=stream)
+
+        if estimateParameters['timeOffset']:
+            msg = "cam{} to imu0 time: [s] (t_imu = t_cam + shift) {}".format(cameraId, self.getResultTimeShift())
+            if withCov:
+                msg += " +- {}".format(self.variable_stds["timeOffset"])
+            print(msg, file=stream)
+
+        if estimateParameters['shutter']:
+            msg = "cam{} line delay: [s] {}".format(cameraId, self.getResultLineDelay())
+            if withCov:
+                msg += " +- {}".format(self.variable_stds["shutter"])
+            print(msg, file=stream)
+
+        if estimateParameters['intrinsics']:
+            msg = "cam{} intrinsics: [s] {}".format(cameraId, self.getResultProjection())
+            if withCov:
+                msg += " +- {}".format(self.variable_stds["intrinsics"])
+            print(msg, file=stream)
+        if estimateParameters['distortion']:
+            msg = "cam{} distortion: [s] {}".format(cameraId, self.getResultDistortion())
+            if withCov:
+                msg += " +- {}".format(self.variable_stds["distortion"])
+            print(msg, file=stream)
+
+    def isRollingShutter(self):
+        return self.camera.shutterType == acv.RollingShutter
+
+    def getLineDelaySeconds(self):
+        if self.isRollingShutter():
+            return self.camera.geometry.shutter().getParameters().flatten()[0]
+        else:
+            return 0
+
+    def generateIntrinsicsInitialGuess(self, estimateIntrinsics, estimateDistortion, estimateLineDelay):
+        """
+        Get an initial guess for the camera geometry (intrinsics, distortion). Distortion is typically left as 0,0,0,0.
+        The parameters of the geometryModel are updated in place.
+        """
+        if self.isRollingShutter() and estimateLineDelay:
+            resolution = self.camConfig.getResolution()
+            sensorRows = resolution[1]
+            times = [observation.time().toSec() for observation in self.targetObservations]
+            times = np.sort(times)
+            deltaTimes = np.diff(times)
+            estimatedFps = 1.0 / np.median(deltaTimes)
+            self.camera.geometry.shutter().setParameters(np.array([1.0 / (estimatedFps * float(sensorRows))]))
+            print('After initialization, line delay, projection, distortion, and shutter parameters: {}'.format(
+                self.camera.geometry.getParameters(True, True, True).T))
+
+    def computeCameraPoses(self):
+        """Estimate the pose of the camera with a PnP solver. Call after initializing the intrinsics"""
+        # estimate and set T_c in the observations
+        for idx, observation in enumerate(self.targetObservations):
+            (success, T_t_c) = self.camera.geometry.estimateTransformation(observation)
+            if success:
+                observation.set_T_t_c(T_t_c)
+            else:
+                sm.logWarn("Could not estimate T_t_c for observation at index {0}".format(idx))
+
+    def addCameraErrorTerms(self, problem, poseSplineDv, T_cN_b, blakeZissermanDf=0.0, timeOffsetConstantSparsityPattern=0.0):
         print("")
         print("Adding camera error terms ({0})".format(self.dataset.topic))
         
@@ -337,7 +485,10 @@ class IccCamera():
 
         allReprojectionErrors = list()
         error_t = self.camera.reprojectionErrorType
-        
+        resolution = self.camConfig.getResolution()
+        sensorRows = resolution[1]
+        dummyPoint = np.array([0, sensorRows / 2])
+        centerRowTemporalOffset = self.camera.dv.temporalOffset(dummyPoint)
         for obs in self.targetObservations:
             # Build a transformation expression for the time.
             frameTime = self.cameraTimeToImuTimeDv.toExpression() + obs.time().toSec() + self.timeshiftCamToImuPrior
@@ -347,15 +498,7 @@ class IccCamera():
             #we need to make sure that we dont add data outside the spline definition
             if frameTimeScalar <= poseSplineDv.spline().t_min() or frameTimeScalar >= poseSplineDv.spline().t_max():
                 continue
-            
-            T_w_b = poseSplineDv.transformationAtTime(frameTime, timeOffsetPadding, timeOffsetPadding)
-            T_b_w = T_w_b.inverse()
 
-            #calibration target coords to camera N coords
-            #T_b_w: from world to imu coords
-            #T_cN_b: from imu to camera N coords
-            T_c_w = T_cN_b  * T_b_w
-            
             #get the image and target points corresponding to the frame
             imageCornerPoints =  np.array( obs.getCornersImageFrame() ).T
             targetCornerPoints = np.array( obs.getCornersTargetFrame() ).T
@@ -363,11 +506,14 @@ class IccCamera():
             #setup an aslam frame (handles the distortion)
             frame = self.camera.frameType()
             frame.setGeometry(self.camera.geometry)
-            
+            initialFrameTime = acv.Time(frameTimeScalar)
+            frame.setTime(initialFrameTime) # Timestamp for the frame is only used in computing covarianceMap for ReprojectionErrorAdaptiveCovariance.
+            self.__frames.append(frame)
+
             #corner uncertainty
             R = np.eye(2) * self.cornerUncertainty * self.cornerUncertainty
             invR = np.linalg.inv(R)
-            
+
             for pidx in range(0,imageCornerPoints.shape[1]):
                 #add all image points
                 k = self.camera.keypointType()
@@ -377,28 +523,128 @@ class IccCamera():
             
             reprojectionErrors=list()
             for pidx in range(0,imageCornerPoints.shape[1]):
+                temporalOffset = self.camera.dv.temporalOffset(imageCornerPoints[:, pidx])
+                keypointTime = frameTime + temporalOffset - centerRowTemporalOffset
+
+                # from body at t to world transformation.
+                T_w_bt = poseSplineDv.transformationAtTime(
+                    keypointTime,
+                    timeOffsetConstantSparsityPattern,
+                    timeOffsetConstantSparsityPattern)
+                T_bt_w = T_w_bt.inverse()
+                T_ct_w = T_cN_b * T_bt_w
+
                 #add all target points
                 targetPoint = np.insert( targetCornerPoints.transpose()[pidx], 3, 1)
-                p = T_c_w *  aopt.HomogeneousExpression( targetPoint )
-             
+                p_t = T_ct_w * aopt.HomogeneousExpression( targetPoint )
+
                 #build and append the error term
-                rerr = error_t(frame, pidx, p)
-                
+                if self.isRollingShutter():
+                    rerr = error_t(
+                        frame,
+                        pidx,
+                        p_t,
+                        self.camera.dv,
+                        poseSplineDv
+                    )
+                else:
+                    rerr = error_t(
+                        frame,
+                        pidx,
+                        p_t,
+                        self.camera.dv
+                    )
+
                 #add blake-zisserman m-estimator
                 if blakeZissermanDf>0.0:
                     mest = aopt.BlakeZissermanMEstimator( blakeZissermanDf )
                     rerr.setMEstimatorPolicy(mest)
-                
-                problem.addErrorTerm(rerr)  
+
+                problem.addErrorTerm(rerr)
                 reprojectionErrors.append(rerr)
-            
+
             allReprojectionErrors.append(reprojectionErrors)
-                        
+
             #update progress bar
             iProgress.sample()
-            
-        print("\r  Added {0} camera error terms                      ".format( len(self.targetObservations) ))           
+
+        print("\r  Added error terms for {} frames                      ".format( len(self.targetObservations) ))
         self.allReprojectionErrors = allReprojectionErrors
+
+    def getReprojectedCorners(self, poseSplineDv, T_cN_b, timeOffsetPadding = 0.0, frameIndex = 0):
+        """
+        Reproject detected corners in a frame.
+        :param poseSplineDv:
+        :param T_cN_b:
+        :param timeOffsetPadding:
+        :param frameIndex:
+        :return: a NX6 array. Each row corresponds to an observed landmark.
+        The 6 columns correspond to reprojected point by method 1, reprojected point by method 2,
+        and the detected corner. The reprojection by the two methods are almost the same.
+        """
+        obs = self.targetObservations[frameIndex]
+        imageCornerPoints =  np.array( obs.getCornersImageFrame()) # Nx2
+        
+        # Build a transformation expression for the time.
+        frameTime = self.cameraTimeToImuTimeDv.toExpression() + obs.time().toSec() + self.timeshiftCamToImuPrior
+        frameTimeScalar = frameTime.toScalar()
+
+        # as we are applying an initial time shift outside the optimization so 
+        # we need to make sure that we dont add data outside the spline definition
+        if frameTimeScalar <= poseSplineDv.spline().t_min() or frameTimeScalar >= poseSplineDv.spline().t_max():
+            return np.array([])
+
+        T_w_b = poseSplineDv.transformationAtTime(frameTime, timeOffsetPadding, timeOffsetPadding)
+        T_b_w = T_w_b.inverse()
+        # calibration target coords to camera N coords
+        # T_b_w: from world to imu coords
+        # T_cN_b: from imu to camera N coords
+        T_c_w = T_cN_b  * T_b_w
+
+        # 1. Naive approach to reproject landmarks with double numbers.
+        frame = self.camera.frameType()
+        frame.setGeometry(self.camera.geometry)
+        frame.setTime(acv.Time(frameTimeScalar))
+        R = np.eye(2) * self.cornerUncertainty * self.cornerUncertainty
+        invR = np.linalg.inv(R)
+        for pidx in range(0,imageCornerPoints.shape[0]):
+            k = self.camera.keypointType()
+            k.setMeasurement(imageCornerPoints[pidx, :])
+            k.setInverseMeasurementCovariance(invR)
+            frame.addKeypoint(k)
+
+        predictedMeasurements = list()
+        error_t = self.camera.reprojectionErrorType
+        targetCornerPoints = np.array(obs.getCornersTargetFrame()) # NX3
+        for pidx in range(0,imageCornerPoints.shape[0]):
+            targetPoint = np.insert(targetCornerPoints[pidx], 3, 1)
+            p = T_c_w *  aopt.HomogeneousExpression(targetPoint)
+            if self.isRollingShutter():
+                rerr = error_t(frame, pidx, p, self.camera.dv, poseSplineDv)
+            else:
+                rerr = error_t(frame, pidx, p, self.camera.dv)
+            rerr.evaluateError()
+            predictedMeas = imageCornerPoints[pidx, :].T - rerr.error()
+            # We have to subtract error to get the prediction because getPredictedMeasurement is not exposed 
+            # for this type of reprojectionError, e.g., SimpleReprojectionError. 
+            # Interestingly, the reprojectionError in kalibr_calibrate_cameras can call its exposed
+            # getPredictedMeasurement. The reason behind this nuance I believe is that
+            # imu_camera_calibration used a templated camera reprojectionError scheme represented by error_t.
+            predictedMeasurements.append(predictedMeas)
+        predictedMeasArray= np.array(predictedMeasurements) # NX2
+
+        # 2. Simple approach to reproject landmarks with float numbers.
+        obs.set_T_t_c(sm.Transformation(T_c_w.toTransformationMatrix()).inverse())
+        imageCornerProjected =  np.array(obs.getCornerReprojection(self.camera.geometry)) # Nx2
+        return np.concatenate((predictedMeasArray, imageCornerProjected, imageCornerPoints), axis=1)
+
+    def getCornersTargetSample(self, frameIndex):
+        """
+        return Nx3 target landmark coordinates.
+        """
+        obs = self.targetObservations[frameIndex]
+        return np.array(obs.getCornersTargetFrame())
+
 
 #pair of cameras with overlapping field of view (perfectly synced cams required!!)
 #
@@ -419,15 +665,21 @@ class IccCameraChain():
         self.camList = []
         for camNr in range(0, chainConfig.numCameras()):
             camConfig = chainConfig.getCameraParameters(camNr)
-            dataset = initCameraBagDataset(parsed.bagfile[0], camConfig.getRosTopic(), \
-                                           parsed.bag_from_to, parsed.bag_freq, parsed.perform_synchronization)
+
+            if camConfig.hasImageNoise():
+                reprojectionSigma = camConfig.getImageNoise()
+            else:
+                reprojectionSigma = parsed.reprojection_sigma
+
+            dataset = initCameraDataset(parsed.bagfile[0], camConfig.getRosTopic(),
+                                        parsed.bag_from_to, parsed.perform_synchronization)
             
             #create the camera
             self.camList.append( IccCamera( camConfig, 
                                             targetConfig, 
                                             dataset, 
                                             #Ultimately, this should come from the camera yaml.
-                                            reprojectionSigma=parsed.reprojection_sigma, 
+                                            reprojectionSigma=reprojectionSigma,
                                             showCorners=parsed.showextraction,
                                             showReproj=parsed.showextraction, 
                                             showOneStep=parsed.extractionstepping) )  
@@ -514,22 +766,31 @@ class IccCameraChain():
         return T_cN_imu
     
     def getResultTimeShift(self, camNr):
-        return self.camList[camNr].cameraTimeToImuTimeDv.toScalar() + self.camList[camNr].timeshiftCamToImuPrior
-    
-    def addDesignVariables(self, problem, noTimeCalibration = True, noChainExtrinsics = True):
+        return self.camList[camNr].getResultTimeShift()
+
+    def getResultLineDelay(self, camNr):
+        return self.camList[camNr].getResultLineDelay()
+
+    def getResultProjection(self, camNr):
+        return self.camList[camNr].getResultProjection()
+
+    def getResultDistortion(self, camNr):
+        return self.camList[camNr].getResultDistortion()
+
+    def addDesignVariables(self, problem, estimateParameters):
         #add the design variables (T(R,t) & time)  for all induvidual cameras
         for camNr, cam in enumerate( self.camList ):
             #the first "baseline" dv is between the imu and cam0
             if camNr == 0:
                 noExtrinsics = False
-                baselinedv_group_id = CALIBRATION_GROUP_ID
+                baselinedv_group_id = ic.CALIBRATION_GROUP_ID
             else:
-                noExtrinsics = noChainExtrinsics
-                baselinedv_group_id = HELPER_GROUP_ID
-            cam.addDesignVariables(problem, noExtrinsics, noTimeCalibration, baselinedv_group_id=baselinedv_group_id)
+                noExtrinsics = not estimateParameters['chainExtrinsics']
+                baselinedv_group_id = ic.HELPER_GROUP_ID
+            cam.addDesignVariables(problem, estimateParameters, noExtrinsics, baselinedv_group_id=baselinedv_group_id)
     
     #add the reprojection error terms for all cameras in the chain
-    def addCameraChainErrorTerms(self, problem, poseSplineDv, blakeZissermanDf=-1, timeOffsetPadding=0.0):
+    def addCameraChainErrorTerms(self, problem, poseSplineDv, blakeZissermanDf=-1, timeOffsetConstantSparsityPattern=0.0):
         
         #add the induviduak error terms for all cameras
         for camNr, cam in enumerate(self.camList):
@@ -544,17 +805,25 @@ class IccCameraChain():
             T_cN_b = T_chain
             
             #add the error terms
-            cam.addCameraErrorTerms( problem, poseSplineDv, T_cN_b, blakeZissermanDf, timeOffsetPadding )
+            cam.addCameraErrorTerms( problem, poseSplineDv, T_cN_b, blakeZissermanDf, timeOffsetConstantSparsityPattern)
+
+    def getReprojectedCorners(self, poseSplineDv, timeOffsetPadding = 0.0,
+                              cameraIndex = 0, frameIndex = 0):
+        T_cN_b = self.camList[cameraIndex].T_c_b_Dv.toExpression()
+        return self.camList[cameraIndex].getReprojectedCorners(
+                poseSplineDv, T_cN_b, timeOffsetPadding, frameIndex) 
+
+    def getCornersTargetSample(self, cameraIndex, frameIndex):    
+        return self.camList[cameraIndex].getCornersTargetSample(frameIndex)
 
 #IMU
 class IccImu(object):
     
     class ImuParameters(kc.ImuParameters):
-        def __init__(self, imuConfig, imuNr):
-            kc.ImuParameters.__init__(self, '', True)
+        def __init__(self, imuConfig):
+            kc.ImuParameters.__init__(self, imuConfig.yamlFile, True)
             self.data = imuConfig.data
             self.data["model"] = "calibrated"
-            self.imuNr = imuNr
 
         def setImuPose(self, T_i_b):
             self.data["T_i_b"] = T_i_b.tolist()
@@ -568,7 +837,7 @@ class IccImu(object):
         def printDetails(self, dest=sys.stdout):
             print("  Model: {0}".format(self.data["model"]), file=dest)
             kc.ImuParameters.printDetails(self, dest)
-            print("  T_ib (imu0 to imu{0})".format(self.imuNr), file=dest)
+            print("  T_i_b", file=dest)
             print(self.formatIndented("    ", np.array(self.data["T_i_b"])), file=dest)
             print("  time offset with respect to IMU0: {0} [s]".format(self.data["time_offset"]), file=dest)
 
@@ -577,22 +846,23 @@ class IccImu(object):
         return self.imuConfig
 
     def updateImuConfig(self):
-        self.imuConfig.setImuPose(self.getTransformationFromBodyToImu().T())
+        self.imuConfig.setImuPose(sm.Transformation(sm.r2quat(self.q_i_b_Dv.toRotationMatrix()), \
+                                                    self.r_b_Dv.toEuclidean()).T())
         self.imuConfig.setTimeOffset(self.timeOffset)
 
-    def __init__(self, imuConfig, parsed, isReferenceImu=True, estimateTimedelay=True, imuNr=0):
+    def __init__(self, imuConfig, parsed, isReferenceImu=True, estimateTimedelay=True):
 
         #determine whether IMU coincides with body frame (for multi-IMU setups)
         self.isReferenceImu = isReferenceImu
         self.estimateTimedelay = estimateTimedelay
 
         #store input
-        self.imuConfig = self.ImuParameters(imuConfig, imuNr)
+        self.imuConfig = self.ImuParameters(imuConfig)
 
         #load dataset
-        self.dataset = initImuBagDataset(parsed.bagfile[0], imuConfig.getRosTopic(), \
-                                         parsed.bag_from_to, parsed.perform_synchronization)
-        
+        self.dataset = initImuDataset(parsed.bagfile[0], imuConfig.getRosTopic(), \
+                                      parsed.bag_from_to, parsed.perform_synchronization)
+
         #statistics
         self.accelUncertaintyDiscrete, self.accelRandomWalk, self.accelUncertainty = self.imuConfig.getAccelerometerStatistics()
         self.gyroUncertaintyDiscrete, self.gyroRandomWalk, self.gyroUncertainty = self.imuConfig.getGyroStatistics()
@@ -600,7 +870,8 @@ class IccImu(object):
         #init GyroBiasPrior (+ count for recursive averaging if we have more than 1 measurement = >1 cameras)
         self.GyroBiasPrior = np.array([0,0,0])
         self.GyroBiasPriorCount = 0
-        
+        self.constantBias = parsed.constant_bias
+
         #load the imu dataset
         self.loadImuData()
 
@@ -647,24 +918,66 @@ class IccImu(object):
             
     def addDesignVariables(self, problem):
         #create design variables
-        self.gyroBiasDv = asp.EuclideanBSplineDesignVariable( self.gyroBias )
-        self.accelBiasDv = asp.EuclideanBSplineDesignVariable( self.accelBias )
+        if self.constantBias:
+            self.gyroBiasDv = aopt.EuclideanPointDv(self.GyroBiasPrior)
+            self.gyroBiasDv.setActive(True)
+            problem.addDesignVariable(self.gyroBiasDv, ic.HELPER_GROUP_ID)
+            self.accelBiasDv = aopt.EuclideanPointDv(np.zeros(3))
+            self.accelBiasDv.setActive(True)
+            problem.addDesignVariable(self.accelBiasDv, ic.HELPER_GROUP_ID)
+        else:
+            self.gyroBiasDv = asp.EuclideanBSplineDesignVariable(self.gyroBias)
+            self.accelBiasDv = asp.EuclideanBSplineDesignVariable(self.accelBias)
         
-        addSplineDesignVariables(problem, self.gyroBiasDv, setActive=True,
-                                    group_id=HELPER_GROUP_ID)
-        addSplineDesignVariables(problem, self.accelBiasDv, setActive=True,
-                                    group_id=HELPER_GROUP_ID)
+            ic.addSplineDesignVariables(problem, self.gyroBiasDv, setActive=True, \
+                                        group_id=ic.HELPER_GROUP_ID)
+            ic.addSplineDesignVariables(problem, self.accelBiasDv, setActive=True, \
+                                        group_id=ic.HELPER_GROUP_ID)
 
         self.q_i_b_Dv = aopt.RotationQuaternionDv(self.q_i_b_prior)
-        problem.addDesignVariable(self.q_i_b_Dv, HELPER_GROUP_ID)
+        problem.addDesignVariable(self.q_i_b_Dv, ic.HELPER_GROUP_ID)
         self.q_i_b_Dv.setActive(False)
         self.r_b_Dv = aopt.EuclideanPointDv(np.array([0., 0., 0.]))
-        problem.addDesignVariable(self.r_b_Dv, HELPER_GROUP_ID)
+        problem.addDesignVariable(self.r_b_Dv, ic.HELPER_GROUP_ID)
         self.r_b_Dv.setActive(False)
 
         if not self.isReferenceImu:
             self.q_i_b_Dv.setActive(True)
             self.r_b_Dv.setActive(True)
+
+    def evaluateGyroBias(self, time):
+        """
+
+        :param time: double type, in seconds
+        :return:
+        """
+        if self.constantBias:
+            return self.gyroBiasDv.toEuclidean()
+        else:
+            return self.gyroBiasDv.spline().eval(time)
+
+    def gyroBiasExpression(self, time):
+        """
+
+        :param time: double type, in seconds
+        :return:
+        """
+        if self.constantBias:
+            return self.gyroBiasDv.toExpression()
+        else:
+            return self.gyroBiasDv.toEuclideanExpression(time, 0)
+
+    def evaluateAccelerometerBias(self, time):
+        if self.constantBias:
+            return self.accelBiasDv.toEuclidean()
+        else:
+            return self.accelBiasDv.spline().eval(time)
+
+    def accelerometerBiasExpression(self, time):
+        if self.constantBias:
+            return self.accelBiasDv.toExpression()
+        else:
+            return self.accelBiasDv.toEuclideanExpression(time, 0)
 
     def addAccelerometerErrorTerms(self, problem, poseSplineDv, g_w, mSigma=0.0, \
                                    accelNoiseScale=1.0):
@@ -690,7 +1003,7 @@ class IccImu(object):
             if tk > poseSplineDv.spline().t_min() and tk < poseSplineDv.spline().t_max():
                 C_b_w = poseSplineDv.orientation(tk).inverse()
                 a_w = poseSplineDv.linearAcceleration(tk)
-                b_i = self.accelBiasDv.toEuclideanExpression(tk,0)
+                b_i = self.accelerometerBiasExpression(tk)
                 w_b = poseSplineDv.angularVelocityBodyFrame(tk)
                 w_dot_b = poseSplineDv.angularAccelerationBodyFrame(tk)
                 C_i_b = self.q_i_b_Dv.toExpression()
@@ -713,7 +1026,7 @@ class IccImu(object):
     def addGyroscopeErrorTerms(self, problem, poseSplineDv, mSigma=0.0, gyroNoiseScale=1.0, \
                                g_w=None):
         print("")
-        print("Adding gyroscope error terms ({0})".format(self.dataset.topic))
+        print("Adding gyroscope error terms ({0}) without misalignment ".format(self.dataset.topic))
         
         #progress bar
         iProgress = sm.Progress2( len(self.imuData) )
@@ -732,7 +1045,7 @@ class IccImu(object):
             if tk > poseSplineDv.spline().t_min() and tk < poseSplineDv.spline().t_max():
                 # GyroscopeError(measurement, invR, angularVelocity, bias)
                 w_b = poseSplineDv.angularVelocityBodyFrame(tk)
-                b_i = self.gyroBiasDv.toEuclideanExpression(tk,0)
+                b_i = self.gyroBiasExpression(tk)
                 C_i_b = self.q_i_b_Dv.toExpression()
                 w = C_i_b * w_b
                 gerr = ket.EuclideanError(im.omega, im.omegaInvR * weight, w + b_i)
@@ -765,6 +1078,8 @@ class IccImu(object):
         self.accelBias.initConstantSpline(start,end,knots, np.zeros(3))
         
     def addBiasMotionTerms(self, problem):
+        if self.constantBias:
+            return
         Wgyro = np.eye(3) / (self.gyroRandomWalk * self.gyroRandomWalk)
         Waccel =  np.eye(3) / (self.accelRandomWalk * self.accelRandomWalk)
         gyroBiasMotionErr = asp.BSplineEuclideanMotionError(self.gyroBiasDv, Wgyro, 1)
@@ -776,8 +1091,8 @@ class IccImu(object):
         if self.isReferenceImu:
             return sm.Transformation()
         return sm.Transformation(sm.r2quat(self.q_i_b_Dv.toRotationMatrix()) , \
-                                 - np.dot(self.q_i_b_Dv.toRotationMatrix(), \
-                                          self.r_b_Dv.toEuclidean()))
+                                 np.dot(self.q_i_b_Dv.toRotationMatrix(), \
+                                        self.r_b_Dv.toEuclidean()))
 
     def findOrientationPrior(self, referenceImu):
         print("")
@@ -827,7 +1142,7 @@ class IccImu(object):
         #define the optimization 
         options = aopt.Optimizer2Options()
         options.verbose = False
-        options.linearSolver = aopt.BlockCholeskyLinearSystemSolver() #does not have multi-threading support
+        options.linearSolver = aopt.BlockCholeskyLinearSystemSolver()
         options.nThreads = 2
         options.convergenceDeltaX = 1e-4
         options.convergenceDeltaJ = 1
@@ -912,8 +1227,8 @@ class IccImu(object):
 class IccScaledMisalignedImu(IccImu):
 
     class ImuParameters(IccImu.ImuParameters):
-        def __init__(self, imuConfig, imuNr):
-            IccImu.ImuParameters.__init__(self, imuConfig, imuNr)
+        def __init__(self, imuConfig):
+            IccImu.ImuParameters.__init__(self, imuConfig)
             self.data = imuConfig.data
             self.data["model"] = "scale-misalignment"
 
@@ -949,21 +1264,21 @@ class IccScaledMisalignedImu(IccImu):
         IccImu.addDesignVariables(self, problem)
 
         self.q_gyro_i_Dv = aopt.RotationQuaternionDv(np.array([0., 0., 0., 1.]))
-        problem.addDesignVariable(self.q_gyro_i_Dv, HELPER_GROUP_ID)
+        problem.addDesignVariable(self.q_gyro_i_Dv, ic.HELPER_GROUP_ID)
         self.q_gyro_i_Dv.setActive(True)
 
         self.M_accel_Dv = aopt.MatrixBasicDv(np.eye(3), np.array([[1, 0, 0],[1, 1, 0],[1, 1, 1]], \
                                                                  dtype=int))
-        problem.addDesignVariable(self.M_accel_Dv, HELPER_GROUP_ID)
+        problem.addDesignVariable(self.M_accel_Dv, ic.HELPER_GROUP_ID)
         self.M_accel_Dv.setActive(True)
         
         self.M_gyro_Dv = aopt.MatrixBasicDv(np.eye(3), np.array([[1, 0, 0],[1, 1, 0],[1, 1, 1]], \
                                                                 dtype=int))
-        problem.addDesignVariable(self.M_gyro_Dv, HELPER_GROUP_ID)
+        problem.addDesignVariable(self.M_gyro_Dv, ic.HELPER_GROUP_ID)
         self.M_gyro_Dv.setActive(True)
         
         self.M_accel_gyro_Dv = aopt.MatrixBasicDv(np.zeros((3,3)),np.ones((3,3),dtype=int))
-        problem.addDesignVariable(self.M_accel_gyro_Dv, HELPER_GROUP_ID)
+        problem.addDesignVariable(self.M_accel_gyro_Dv, ic.HELPER_GROUP_ID)
         self.M_accel_gyro_Dv.setActive(True)
 
     def addAccelerometerErrorTerms(self, problem, poseSplineDv, g_w, mSigma=0.0, \
@@ -990,7 +1305,7 @@ class IccScaledMisalignedImu(IccImu):
             if tk > poseSplineDv.spline().t_min() and tk < poseSplineDv.spline().t_max():
                 C_b_w = poseSplineDv.orientation(tk).inverse()
                 a_w = poseSplineDv.linearAcceleration(tk)
-                b_i = self.accelBiasDv.toEuclideanExpression(tk,0)
+                b_i = self.accelerometerBiasExpression(tk)
                 M = self.M_accel_Dv.toExpression()
                 w_b = poseSplineDv.angularVelocityBodyFrame(tk)
                 w_dot_b = poseSplineDv.angularAccelerationBodyFrame(tk)
@@ -1014,7 +1329,7 @@ class IccScaledMisalignedImu(IccImu):
 
     def addGyroscopeErrorTerms(self, problem, poseSplineDv, mSigma=0.0, gyroNoiseScale=1.0, g_w=None):
         print("")
-        print("Adding gyroscope error terms ({0})".format(self.dataset.topic))
+        print("Adding gyroscope error terms ({0}) with misalignment ".format(self.dataset.topic))
         
         #progress bar
         iProgress = sm.Progress2( len(self.imuData) )
@@ -1034,7 +1349,7 @@ class IccScaledMisalignedImu(IccImu):
                 # GyroscopeError(measurement, invR, angularVelocity, bias)
                 w_b = poseSplineDv.angularVelocityBodyFrame(tk)
                 w_dot_b = poseSplineDv.angularAccelerationBodyFrame(tk)
-                b_i = self.gyroBiasDv.toEuclideanExpression(tk,0)
+                b_i = self.gyroBiasExpression(tk)
                 C_b_w = poseSplineDv.orientation(tk).inverse()
                 a_w = poseSplineDv.linearAcceleration(tk)
                 r_b = self.r_b_Dv.toExpression()
@@ -1064,8 +1379,8 @@ class IccScaledMisalignedImu(IccImu):
 class IccScaledMisalignedSizeEffectImu(IccScaledMisalignedImu):
 
     class ImuParameters(IccScaledMisalignedImu.ImuParameters):
-        def __init__(self, imuConfig, imuNr):
-            IccScaledMisalignedImu.ImuParameters.__init__(self, imuConfig, imuNr)
+        def __init__(self, imuConfig):
+            IccScaledMisalignedImu.ImuParameters.__init__(self, imuConfig)
             self.data = imuConfig.data
             self.data["model"] = "scale-misalignment-size-effect"
 
@@ -1096,25 +1411,25 @@ class IccScaledMisalignedSizeEffectImu(IccScaledMisalignedImu):
         IccScaledMisalignedImu.addDesignVariables(self, problem)
 
         self.rx_i_Dv = aopt.EuclideanPointDv(np.array([0., 0., 0.]))
-        problem.addDesignVariable(self.rx_i_Dv, HELPER_GROUP_ID)
+        problem.addDesignVariable(self.rx_i_Dv, ic.HELPER_GROUP_ID)
         self.rx_i_Dv.setActive(False)
         
         self.ry_i_Dv = aopt.EuclideanPointDv(np.array([0., 0., 0.]))
-        problem.addDesignVariable(self.ry_i_Dv, HELPER_GROUP_ID)
+        problem.addDesignVariable(self.ry_i_Dv, ic.HELPER_GROUP_ID)
         self.ry_i_Dv.setActive(True)
 
         self.rz_i_Dv = aopt.EuclideanPointDv(np.array([0., 0., 0.]))
-        problem.addDesignVariable(self.rz_i_Dv, HELPER_GROUP_ID)
+        problem.addDesignVariable(self.rz_i_Dv, ic.HELPER_GROUP_ID)
         self.rz_i_Dv.setActive(True)
 
         self.Ix_Dv = aopt.MatrixBasicDv(np.diag([1.,0.,0.]), np.zeros((3,3),dtype=int))
-        problem.addDesignVariable(self.Ix_Dv, HELPER_GROUP_ID)
+        problem.addDesignVariable(self.Ix_Dv, ic.HELPER_GROUP_ID)
         self.Ix_Dv.setActive(False)
         self.Iy_Dv = aopt.MatrixBasicDv(np.diag([0.,1.,0.]), np.zeros((3,3),dtype=int))
-        problem.addDesignVariable(self.Iy_Dv, HELPER_GROUP_ID)
+        problem.addDesignVariable(self.Iy_Dv, ic.HELPER_GROUP_ID)
         self.Iy_Dv.setActive(False)
         self.Iz_Dv = aopt.MatrixBasicDv(np.diag([0.,0.,1.]), np.zeros((3,3),dtype=int))
-        problem.addDesignVariable(self.Iz_Dv, HELPER_GROUP_ID)
+        problem.addDesignVariable(self.Iz_Dv, ic.HELPER_GROUP_ID)
         self.Iz_Dv.setActive(False)
 
     def addAccelerometerErrorTerms(self, problem, poseSplineDv, g_w, mSigma=0.0, \
@@ -1141,7 +1456,7 @@ class IccScaledMisalignedSizeEffectImu(IccScaledMisalignedImu):
             if tk > poseSplineDv.spline().t_min() and tk < poseSplineDv.spline().t_max():
                 C_b_w = poseSplineDv.orientation(tk).inverse()
                 a_w = poseSplineDv.linearAcceleration(tk)
-                b_i = self.accelBiasDv.toEuclideanExpression(tk,0)
+                b_i = self.accelerometerBiasExpression(tk)
                 M = self.M_accel_Dv.toExpression()
                 w_b = poseSplineDv.angularVelocityBodyFrame(tk)
                 w_dot_b = poseSplineDv.angularAccelerationBodyFrame(tk)

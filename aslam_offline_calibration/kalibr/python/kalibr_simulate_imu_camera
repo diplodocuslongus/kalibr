@@ -1,0 +1,130 @@
+#!/usr/bin/env python
+
+import argparse
+import signal
+import sys
+import numpy as np
+
+import sm
+import kalibr_common as kc
+from kalibr_imu_camera_calibration import Simulator
+
+# make numpy print prettier
+np.set_printoptions(suppress=True)
+
+def signal_exit(signal, frame):
+    print
+    sm.logWarn("Shutting down! (CTRL+C)")
+    sys.exit(1)
+
+#helper to constrain certain arguments to be specified only once
+class Once(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string = None):
+        if getattr(namespace, self.dest) is not None:
+            msg = '{o} can only be specified once'.format(o = option_string)
+            raise argparse.ArgumentError(None, msg)
+        setattr(namespace, self.dest, values)
+
+def parseArgs():
+    class KalibrArgParser(argparse.ArgumentParser):
+        def error(self, message):
+            self.print_help()
+            sm.logError('%s' % message)
+            sys.exit(2)
+        def format_help(self):
+            formatter = self._get_formatter()
+            formatter.add_text(self.description)
+            formatter.add_usage(self.usage, self._actions,
+                                self._mutually_exclusive_groups)
+            for action_group in self._action_groups:
+                formatter.start_section(action_group.title)
+                formatter.add_text(action_group.description)
+                formatter.add_arguments(action_group._group_actions)
+                formatter.end_section()
+            formatter.add_text(self.epilog)
+            return formatter.format_help()
+
+    usage = """
+    Example usage to generate the visual inertial system states at specific epochs and
+     observations of a calibration target with a rolling shutter camera model and
+     inertial measurements based on a given B-spline in the 15 dimensional state space.
+    
+    %(prog)s $output_dir/bspline_pose.txt --cam $script_dir/camchain_template.yaml --imu $script_dir/imu_template.yaml \
+        --target $data_dir/april_6x6.yaml --output_dir $output_dir
+
+    camchain.yaml: It contains the camera intrinsic and extrinsic parameters, like the camera-IMU system 
+        calibration output of the camera-imu calibratin tool (kalibr_calibrate_cameras).
+
+    imu.yaml: The IMU parameters.
+    
+    example aprilgrid.yaml:       |  example imu.yaml: (ADIS16448)
+        target_type: 'aprilgrid'  |      accelerometer_noise_density: 0.006  
+        tagCols: 6                |      accelerometer_random_walk: 0.0002
+        tagRows: 6                |      gyroscope_noise_density: 0.0004
+        tagSize: 0.088            |      gyroscope_random_walk: 4.0e-06
+        tagSpacing: 0.3           |      update_rate: 200.0"""
+
+    #setup the argument list
+    parser = KalibrArgParser(description=('Simulate rolling shutter camera measurements and inertial readings'
+        'given bspline poses, camera-IMU configuration, and target description.'), usage=usage)
+
+    #simulation options
+    groupSim = parser.add_argument_group('Simulation options')
+    groupSim.add_argument('pose_file', help='The file of the knot coefficients of the pose B spline')
+    groupSim.add_argument('--gyro-bias-file', dest='gyro_bias_file',
+            help=('The file of the knot coefficients of the gyro bias B spline.'
+                  ' If not specified, its path will be deduced from the pose_file!'))
+    groupSim.add_argument('--acc-bias-file', dest='acc_bias_file',
+            help=('The file of the knot coefficients of the accelerometer bias B spline.'
+                  ' If not specified, its path will be deduced from the pose_file!'))
+    groupSim.add_argument('--output_dir', help='Where to put output files?')
+    groupSim.add_argument('--bias-from-splines', action='store_true', dest='biasFromSplines',
+                          help=('If true, simulate IMU biases and zero noise from provided bias splines. '
+                               'Or else, simulate IMU noise per IMU parameters. (default: %s)'))
+    groupSim.add_argument('--dont-show-report', action='store_true', dest='dontShowReport',
+                          help='Do not show the report on screen after simulation. (default: %s)')
+
+    #configuration files
+    groupCam = parser.add_argument_group('Camera system configuration')
+    groupCam.add_argument('--cam', dest='chain_yaml', help='Camera-IMU system configuration as yaml file '
+                                                           'which should include the field image_noise_std_dev',
+                          required=True, action=Once)
+
+    groupImu = parser.add_argument_group('IMU configuration')
+    groupImu.add_argument('--imu', dest='imu_yaml', help=('Yaml holding the IMU noise parameters.'
+            ' Thanks to the ConfigReader, no hierarchy should be used in the yaml.'))
+
+    groupTarget = parser.add_argument_group('Calibration target')
+    groupTarget.add_argument('--target', dest='target_yaml', help='Calibration target configuration as yaml file',
+                             required=True, action=Once)
+
+    #print help if no argument is specified
+    if len(sys.argv)==1:
+        parser.print_help()
+        sys.exit(2)
+
+    #Parser the argument list
+    try:
+        parsed = parser.parse_args()
+    except:
+        sys.exit(2)
+    return parsed
+
+def main():
+    # Parse the arguments
+    parsed = parseArgs()
+    if not parsed.gyro_bias_file:
+        parsed.gyro_bias_file = parsed.pose_file.replace('pose', 'gyro_bias', 1)
+    if not parsed.acc_bias_file:
+        parsed.acc_bias_file = parsed.pose_file.replace('pose', 'acc_bias', 1)
+
+    if parsed.imu_yaml:
+        simulator = Simulator.RsCameraImuSimulator(parsed)
+    else:
+        simulator = Simulator.RsCameraSimulator(parsed)
+    simulator.checkNaiveVsNewtonRsProjection(parsed.output_dir)
+    simulator.simulate(parsed.output_dir)
+
+
+if __name__ == "__main__":
+    main()

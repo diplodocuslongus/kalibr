@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""
+Estimate the IMU noise parameters in a camera-IMU calibration setup.
+
+Algorithm
+Initialize the noise parameters from experience.
+Repeat two steps:
+1. read the noise parameters, then perform camera-IMU calibration with these parameters, 
+2. compute and save the noise distribution parameters from the residuals.
+Stop when the noise parameters or the total cost do not change much.
+"""
+
+import kalibr_common as kc
+from kontiki import sew
+import numpy as np
+
+import os
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+script_calibrate_imu_camera = os.path.join(this_dir, 'kalibr_calibrate_imu_camera')
+print(script_calibrate_imu_camera)
+
+import imp
+kalibr_calibrate_imu_camera = imp.load_source('kalibr_calibrate_imu_camera', script_calibrate_imu_camera)
+
+import shutil
+
+def loadText(fn):
+    lines = []
+    with open(fn, 'r') as stream:
+        for line in stream:
+            lines.append(line) # Note this keeps the newline character.
+    return lines
+
+
+def dumpText(lines, fn):
+    with open(fn, 'w') as stream:
+        for line in lines:
+            stream.write("{}".format(line))
+
+
+def addParserArguments(parser):
+    groupNoise = parser.add_argument_group('Noise identification')
+    groupNoise.add_argument('--max_noise_opt_iters', type=int, default = 5,
+                            help='max number of iterations for IMU noise optimization. (default: %(default)s)')
+
+
+def loadImuData(path, topic, from_to=None, perform_synchronization=False):
+    if path.endswith('.bag'):
+        dataset = kc.BagImuDatasetReader(path, topic, from_to, perform_synchronization)
+    else:
+        dataset = kc.VimapImuCsvReader(path, topic, from_to, perform_synchronization)
+
+    timestamps = []  # list of acv.Time
+    gyroData = []  # list of numpy array (3,)
+    accelData = []  # list of numpy array (3,)
+    for timestamp, omega, alpha in dataset:
+        time = timestamp.toSec()
+        timestamps.append(time)
+        gyroData.append(omega)
+        accelData.append(alpha)
+    return timestamps, gyroData, accelData
+
+
+def saveCameraNoise(camNoiseList, camChainYaml):
+    """
+
+    :param camNoiseList: image noise for every camera, each element is a dict.
+    :param camChainYaml:
+    :return:
+    """
+    lines = loadText(camChainYaml)
+    for camId, noiseDict in enumerate(camNoiseList):
+        occurrence = 0
+        for lid, line in enumerate(lines):
+            if "image_noise_std_dev" in line:
+                if occurrence == camId:
+                    lines[lid] = "  image_noise_std_dev: {}\n".format(noiseDict["image_noise_std_dev"])
+                    break
+                occurrence += 1
+    dumpText(lines, camChainYaml)
+
+
+def saveImuNoise(imuNoiseList, imuYamlList):
+    """
+
+    :param imuNoiseList: each component is a dict containing noise and random walk parameters in metric units.
+    :param imuYamlList:
+    :return:
+    """
+    for imuId, imuYaml in enumerate(imuYamlList):
+        lines = loadText(imuYaml)
+        for lid, line in enumerate(lines):
+            for noise in ["accelerometer_noise_density", "gyroscope_noise_density"]:
+                if noise in line:
+                    lead = line[:(line.find(noise) + len(noise))]  # This keeps the padding spaces which is needed for yaml.
+                    lines[lid] = "{}: {}\n".format(lead, imuNoiseList[imuId][noise])
+                    break
+            # We should not update random walk parameters.
+            # for noise in ["accelerometer_random_walk", "gyroscope_random_walk"]:
+            #     if noise in line:
+            #         lines[lid] = "{}: {}\n".format(noise, imuNoiseList[imuId][noise])
+            #         break
+        dumpText(lines, imuYaml)
+
+
+def logCameraNoise(camNoises, logstream):
+    for id, noise in enumerate(camNoises):
+        logstream.write("# Camera {}\n".format(id))
+        for key, val in noise.items():
+            logstream.write("{}: {} # px \n".format(key, val))
+
+
+def logImuNoise(imuNoiseList, logstream):
+    for id, noise in enumerate(imuNoiseList):
+        logstream.write("# IMU {}\n".format(id))
+        for key, val in noise.items():
+            logstream.write("{}: {}\n".format(key, val))
+
+
+def main():
+    parser = kalibr_calibrate_imu_camera.createParser()
+    addParserArguments(parser)
+    args = kalibr_calibrate_imu_camera.parseArgs(parser)
+
+    # For safety, we will work on the copy of the imu yamls.
+    imu_yamls_orig = args.imu_yamls
+    imu_yamls = []
+    for imufile in imu_yamls_orig:
+        dst = os.path.basename(os.path.splitext(imufile)[0]) + "_temp.yaml"
+        shutil.copyfile(imufile, dst)
+        imu_yamls.append(dst)
+    args.imu_yamls = imu_yamls
+
+    chain_yaml_orig = args.chain_yaml
+    chain_yaml = os.path.basename(os.path.splitext(chain_yaml_orig)[0]) + "_temp.yaml"
+    shutil.copyfile(chain_yaml_orig, chain_yaml)
+    args.chain_yaml = chain_yaml
+
+    args.identifyNoises = True
+
+    logstream = open("noises.log", 'w')
+
+    # initialize imu and camera noises.
+    imuNoiseList = []
+    minDt = 1000
+
+    for imu_yaml in args.imu_yamls:
+        imuConfig = kc.ImuParameters(imu_yaml)
+        timestamps, gyroData, accelData = loadImuData(args.bagfile[0], imuConfig.getRosTopic(),
+                                                      args.bag_from_to, args.perform_synchronization)
+        imu_gyro = np.transpose(gyroData)
+        imu_acc = np.transpose(accelData)
+        gyroNoise, accNoise, so3_dt, r3_dt, dt = sew.identifyImuNoiseAndKnotSpacing(
+            timestamps, imu_gyro, imu_acc)
+        imuNoise = {"gyroscope_noise_density" : gyroNoise,
+                    "accelerometer_noise_density" : accNoise}
+        imuNoiseList.append(imuNoise)
+        minDt = min(so3_dt, r3_dt, minDt)
+    image_noise_std_dev = 1.0
+    args.pose_knots_per_second = np.ceil(1.0 / minDt)
+    print("Pose knots per second {}".format(args.pose_knots_per_second))
+    logstream.write("# Pose knots per second: {}".format(args.pose_knots_per_second))
+
+    # write noise to yamls which will be read by calibrate_imu_camera()
+    camNoiseList = [{"image_noise_std_dev" : image_noise_std_dev}] * 4  # supports 4 cameras at most.
+    saveCameraNoise(camNoiseList, args.chain_yaml)
+    saveImuNoise(imuNoiseList, args.imu_yamls)
+    logstream.write("# Initialization\n")
+    logCameraNoise(camNoiseList, logstream)
+    logImuNoise(imuNoiseList, logstream)
+
+
+    for outerLoopId in range(args.max_noise_opt_iters):
+        if outerLoopId == 0:
+            args.saveVimap = True
+        else:
+            args.saveVimap = False
+        residualStats = kalibr_calibrate_imu_camera.calibrate_imu_camera(args)
+        print('Final cost function value {}'.format(residualStats['JFinal']))
+
+        camNoiseList = []
+        for camId in range(len(residualStats) - 2):
+            camName = 'cam{}'.format(camId)
+            if camName in residualStats:
+                camNoise = {}
+                data = residualStats[camName]
+                print('Camera {} noises:'.format(camId))
+                for key, val in data.items():
+                    print('\t{}: {}'.format(key, val))
+                    if key == "image_noise_std_dev":
+                        camNoise[key] = np.average(val)
+                    else:
+                        camNoise[key] = val
+                camNoiseList.append(camNoise)
+        saveCameraNoise(camNoiseList, args.chain_yaml)
+        logstream.write("\n# Iteration {}\n".format(outerLoopId))
+        logCameraNoise(camNoiseList, logstream)
+
+        imuNoiseList = []
+        for imuId in range(len(residualStats) - 2):
+            imuName = 'imu{}'.format(imuId)
+            if imuName in residualStats:
+                data = residualStats[imuName]
+                print('IMU {} noises:'.format(imuId))
+
+                imuNoise = {}
+                for noise in ["accelerometer_noise_density", "gyroscope_noise_density"]:
+                    if noise in data:
+                        print('\t{}: {}'.format(noise, data[noise]))
+                        imuNoise[noise] = np.average(data[noise])
+                for noise in ["accelerometer_random_walk", "gyroscope_random_walk"]:
+                    if noise in data:
+                        print('\t{}: {}'.format(noise, data[noise]))
+                        imuNoise[noise] = np.average(data[noise][2, 1:])
+                for noise in ["accelerometer_noise_cov", "gyroscope_noise_cov"]:
+                    if noise in data:
+                        print('\t{}: {}'.format(noise, data[noise]))
+                        imuNoise[noise] = data[noise]
+                imuNoiseList.append(imuNoise)
+        saveImuNoise(imuNoiseList, args.imu_yamls)
+        logImuNoise(imuNoiseList, logstream)
+
+    print('The identified IMU noise parameters are at {}!'.format('\n\t'.join(imu_yamls)))
+    logstream.close()
+
+
+if __name__ == "__main__":
+    main()

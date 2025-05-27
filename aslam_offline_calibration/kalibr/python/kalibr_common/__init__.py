@@ -4,3 +4,5 @@ from .ConfigReader import *
 from .ImageDatasetReader import *
 from .ImuDatasetReader import *
 from .TargetExtractor import *
+from .VimapCsvReader import *
+from .VimapCsvWriter import *
