@@ -1,67 +1,353 @@
 ![Kalibr](https://raw.githubusercontent.com/wiki/ethz-asl/kalibr/images/kalibr_small.png)
 
-[![ROS1 Ubuntu 20.04](https://github.com/ethz-asl/kalibr/actions/workflows/docker_2004_build.yaml/badge.svg)](https://github.com/ethz-asl/kalibr/actions/workflows/docker_2004_build.yaml)
-[![ROS1 Ubuntu 18.04](https://github.com/ethz-asl/kalibr/actions/workflows/docker_1804_build.yaml/badge.svg)](https://github.com/ethz-asl/kalibr/actions/workflows/docker_1804_build.yaml)
-[![ROS1 Ubuntu 16.04](https://github.com/ethz-asl/kalibr/actions/workflows/docker_1604_build.yaml/badge.svg)](https://github.com/ethz-asl/kalibr/actions/workflows/docker_1604_build.yaml)
+- [Introduction](#introduction)
+- [Installation](#installation)
+  - [Ubuntu 18.04 + ROS1 melodic](#ubuntu-1804--ros1-melodic)
+  - [Ubuntu 20.04 + ROS1 noetic](#ubuntu-2004--ros1-noetic)
+- [RS camera-IMU calibration](#rs-camera-imu-calibration)
+- [Simulate RS camera-IMU data from real data](#simulate-rs-camera-imu-data-from-real-data)
+  - [1. Find or record a camera-IMU calibration dataset](#1-find-or-record-a-camera-imu-calibration-dataset)
+  - [2. Run camera-IMU calibration and save the trajectory](#2-run-camera-imu-calibration-and-save-the-trajectory)
+  - [3. Prepare camera and IMU configuration yamls for simulation](#3-prepare-camera-and-imu-configuration-yamls-for-simulation)
+  - [4. Simulate RS camera and IMU data](#4-simulate-rs-camera-and-imu-data)
+- [IMU noise identification](#imu-noise-identification)
+- [Static frame detection](#static-frame-detection)
+- [RS camera calibration with IMU data (experimental)](#rs-camera-calibration-with-imu-data-experimental)
+- [Docker](#docker)
+- [A crash course on calibration with B-splines](#a-crash-course-on-calibration-with-b-splines)
+  - [kalibr_calibrate_imu_camera](#kalibr_calibrate_imu_camera)
+    - [Design variables](#design-variables)
+    - [Get values of design variables](#get-values-of-design-variables)
+    - [Error terms](#error-terms)
+  - [kalibr_calibrate_rs_cameras](#kalibr_calibrate_rs_cameras)
+    - [Design variables](#design-variables-1)
+    - [Error terms](#error-terms-1)
+- [Citing](#citing)
+- [Compiled rolling shutter parameters for consumer products](#compiled-rolling-shutter-parameters-for-consumer-products)
+- [TODOs](#todos)
 
+## quick start
+
+Test on exisiting calibration dataset samples.
+Download the following:
+april_6x6_80x80cm.yaml
+cam_april-camchain.yaml
+camchain-imucam-imu_april.yaml
+imu_adis16448.yaml
+imu_april.bag
+imu-imu_april.yaml
+from:
+https://github.com/ethz-asl/kalibr/wiki/downloads
+
+Put the files in FOLDER path of choice.
+
+Build the docker container for the ROS version of choice.
+Use the updated docker file or an entrypoint error will occur.
+
+    cd kalibr/docker/melodic
+    chmod +x build.sh
+    ./build.sh
+
+This will take some time.
+Check the docker has been built by listing the docker images on the current machine:
+
+    docker images
+
+Start the docker container from the image and run Kalibr.
+
+    cd kalibr/docker
+    chmod +x run.sh
+
+    $ ./run.sh /home/$(whoami)/Data/datasets/Kalibr/EuRoC/ melodic 1
+
+Run kalibr:
+
+    root@119b5f1f5f0b:~/data# kalibr_calibrate_imu_camera --target april_6x6_80x80cm.yaml --cam cam_april-camchain.yaml --imu imu_adis16448.yaml --bag imu_april.bag  --estimate-line-delay --dont-show-report
 ## Introduction
-Kalibr is a toolbox that solves the following calibration problems:
+Kalibr is a popular and excellent calibration toolbox based on continuous-time B-splines
+for calibrating cameras and camera-IMU systems.
 
-1. **Multi-Camera Calibration**: Intrinsic and extrinsic calibration of a camera-systems with non-globally shared overlapping fields of view with support for a wide range of [camera models](https://github.com/ethz-asl/kalibr/wiki/supported-models).
-1. **Visual-Inertial Calibration (CAM-IMU)**: Spatial and temporal calibration of an IMU w.r.t a camera-system along with IMU intrinsic parameters
-1. **Multi-Inertial Calibration (IMU-IMU)**: Spatial and temporal calibration of an IMU w.r.t a base inertial sensor along with IMU intrinsic parameters (requires 1-aiding camera sensor).
-1. **Rolling Shutter Camera Calibration**: Full intrinsic calibration (projection, distortion and shutter parameters) of rolling shutter cameras.
+This fork extends the [original Kalibr](https://github.com/ethz-asl/kalibr) developed by ethz-asl 
+to support rolling shutter (RS) camera-IMU calibration, IMU noise identification, and 
+static frame detection.
+Moreover, this fork supports Ubuntu 20.04 by assimilating the [ori-drs fork](https://github.com/ori-drs/kalibr).
 
-To install follow the [install wiki page](https://github.com/ethz-asl/kalibr/wiki/installation) instructions for which you can either use Docker or install from source in a ROS workspace.
-Please find more information on the [wiki pages](https://github.com/ethz-asl/kalibr/wiki) of this repository.
-For questions or comments, please open an issue on Github.
+Summarily, this package solves the following problems:
+1. **Rolling shutter camera-IMU calibration**:
+   extrinsic and temporal calibration of a rolling shutter camera relative to an rigidly attached IMU
+2. **Simulation from real data for a mono RS camera-IMU system**
+
+3. **IMU noise identification within camera-IMU calibration**:
+   identify the IMU noise parameters for camera-IMU calibration by using the same calibration data 
+   so as to avoid the long Allan variance analysis
+
+4. **Static frame detection**:
+   detect static frames by checking the optic flow of target corners to 
+   simplify the data collection procedure for rolling shutter camera calibration
+
+in addition to the below calibration problem solved by the original Kalibr package:
+>1. **Multiple camera calibration**: 
+>    intrinsic and extrinsic calibration of a camera-systems with non-globally shared overlapping fields of view
+>2. **Visual-inertial calibration calibration (camera-IMU)**:
+>    spatial and temporal calibration of an IMU w.r.t a camera-system
+>3. **Rolling shutter camera calibration**:
+>    full intrinsic calibration (projection, distortion and shutter parameters) of rolling shutter cameras
+The [wiki pages](https://github.com/ethz-asl/kalibr/wiki) of the original Kalibr provide clear and detailed explanations on how to 
+perform the latter three tasks.
+Here we focus on the former three tasks.
+
+## Installation
+
+### Ubuntu 18.04 + ROS1 melodic
+For Ubuntu <=18.04 + ROS1 <= melodic, follow instructions at [here](https://github.com/ethz-asl/kalibr/wiki/installation).
+In addition, install suitesparse by
+```
+sudo apt-get install libsuitesparse-dev
+```
+because this fork uses the system wide suitesparse whereas the original Kalibr builds suitesparse in the Kalibr workspace.
+This installation procedure can be greatly simplified by using the provided Dockerfiles, see the [Docker](#docker) section.
+
+### Ubuntu 20.04 + ROS1 noetic
+
+```
+sudo apt update
+sudo apt-get install python3-setuptools python3-rosinstall ipython3 libeigen3-dev libboost-all-dev doxygen libopencv-dev \
+ros-noetic-vision-opencv ros-noetic-image-transport-plugins ros-noetic-cmake-modules python3-software-properties \
+software-properties-common libpoco-dev python3-matplotlib python3-scipy python3-git python3-pip libtbb-dev libblas-dev \
+liblapack-dev libv4l-dev python3-catkin-tools python3-igraph libsuitesparse-dev
+
+pip3 install wxPython
+```
+If you encounter errors like "E: Unable to locate package python3-catkin-tools",
+then setup the sources.list and keys as instructed [here](http://wiki.ros.org/Installation/Ubuntu).
+
+```
+mkdir ~/kalibr_ws/src
+cd ~/kalibr_ws/src
+git clone --recursive https://github.com/JzHuai0108/kalibr
+
+cd ~/kalibr_ws
+source /opt/ros/noetic/setup.bash
+catkin init
+catkin config --extend /opt/ros/noetic
+catkin config --merge-devel
+catkin config --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+catkin build -DCMAKE_BUILD_TYPE=Release -j4
+```
+
+## RS camera-IMU calibration
+To calibrate a RS camera-IMU system, only two additional parameters are needed compared to the default global shutter (GS) [camera-IMU calibration](https://github.com/ethz-asl/kalibr/wiki/camera-imu-calibration).
+* add parameter *line_delay_nanoseconds* in the camera configuration yaml with an nonzero value, 
+see [a template](aslam_offline_calibration/kalibr/config_templates/camchain_imucam_template.yaml) for example.
+* pass *--estimate-line-delay* to the *kalibr_calibrate_imu_camera* command.
+
+Let's try out RS camera-IMU calibration with the 
+[kalibr dynamic sample data](https://drive.google.com/file/d/0B0T1sizOvRsUcGpTWUNTRC14RzA/edit?usp=sharing) 
+which was collected by a GS camera.
+```
+source ~/kalibr_ws/devel/setup.bash
+cd /path/to/kalibr_dynamic_sample
+
+echo "Calibrate imu-camera system with RS model and estimate-line-delay enabled..."
+sed -i "/line_delay_nanoseconds/c\  line_delay_nanoseconds: 5000" camchain.yaml
+mkdir -p rs_est
+cd rs_est
+kalibr_calibrate_imu_camera --target april_6x6.yaml --cam camchain.yaml --imu imu_adis16448.yaml \
+ --bag dynamic.bag --bag-from-to 5 45 --estimate-line-delay --dont-show-report
+```
+In the final report, you should find the estimated line delay is less than 200 nanoseconds, 
+confirming that the dataset was collected by a GS camera.
+
+## Simulate RS camera-IMU data from real data
+
+### 1. Find or record a camera-IMU calibration dataset
+For instance, you may use the [sample camera-IMU dataset](https://github.com/ethz-asl/kalibr/wiki/downloads).
+
+### 2. Run camera-IMU calibration and save the trajectory
+To enable saving the trajectory represented by B-spline models, 
+pass the argument *--save-splines* to the *kalibr_calibrate_imu_camera* routine.
+This will save the B spline models for the pose trajectory, gyro biases, and accelerometer biases, among others.
+
+### 3. Prepare camera and IMU configuration yamls for simulation
+Refer to the [camera and IMU configuration yaml templates](./aslam_offline_calibration/kalibr/config_templates/) for examples.
+
+### 4. Simulate RS camera and IMU data
+Suppose $output_dir is where the B-spline models are saved, simulate the RS camera-IMU data with.
+```
+kalibr_simulate_imu_camera $output_dir/bspline_pose.txt --cam camchain_imucam.yaml --imu imu.yaml \
+  --target april_6x6.yaml --output_dir $output_dir
+```
+
+Note that currently the simulation only supports simulating for one camera.
+
+The output files are in the [maplab csv dataset format](https://github.com/ethz-asl/maplab/wiki/CSV-Dataset-Format).
+
+## IMU noise identification
+Refer to [test_on_dynamic_sample](ci/test_on_dynamic_sample.sh) for shell scripts on IMU noise identification. More instructions will be added soon.
+
+## Static frame detection
+Refer to [extract_static_frames](aslam_offline_calibration/kalibr/python/extract_static_frames) for more info. More instructions will be added soon.
+
+## RS camera calibration with IMU data (experimental)
+The original RS camera calibration routine calibrates the RS effect and optional camera intrinsic parameters with only camera data.
+Intuitively, its accuracy and stability can be boosted with the IMU data.
+While inheriting the original functionality of kalibr_calibrate_rs_cameras,
+the present implementation can take additional IMU data for constraints.
+For simplicity, the calibrated IMU model is used where the IMU data are modeled with true values, biases, and noises, 
+excluding scale factor errors and misalignment.
+
+To allow use of additional IMU data, 
+* make sure that the rosbag dataset has the IMU data,
+* pass the IMU configuration yaml via *--imu* argument to *kalibr_calibrate_rs_cameras*.
+
+## Docker
+On Ubuntu, we can use kalibr from a docker container without installing its dependencies system-wide (e.g., ROS1) on the host computer.
+Of course, this requires the [docker engine](https://docs.docker.com/engine/install/ubuntu/) installed on the host computer.
+
+To start a docker container where the kalibr can run, we need a docker image which is its blueprint.
+The docker image can be created by building the provided dockerfile.
+The below commands assume that the ROS1 melodic docker image will be created and used, 
+replace melodic with noetic if a ROS1 noetic docker image is desired.
+```
+cd kalibr/docker/melodic
+chmod +x build.sh
+./build.sh
+```
+To confirm that the docker image is created successfully, list the existing docker images by
+```
+docker images
+```
+Then we can start a docker container from the image and run Kalibr.
+
+```
+cd kalibr/docker
+chmod +x run.sh
+./run.sh <folder-of-rosbag> melodic 1
+
+```
+Note that folder-of-rosbag is the folder on the host computer containing the data bag for calibration.
+The run.sh step mounts folder-of-rosbag to /root/data in the docker container, and 
+opens an interactive shell session with the Kalibr workspace loaded in the container.
+Then in the interactive shell, you may run the calibration commands like
+```
+kalibr_calibrate_imu_camera --target april_6x6.yaml --cam camchain.yaml --imu imu_adis16448.yaml \
+ --bag dynamic.bag --bag-from-to 5 45 --estimate-line-delay --dont-show-report
+```
+For some tasks, you may want to open extra shell sessions for the container by 
+```
+docker exec -it <CONTAINER ID> /bin/bash
+# CONTAINER ID can be found by 
+docker ps
+```
+
+## A crash course on calibration with B-splines
+For those interested in developing with kalibr, the building blocks for kalibr_calibrate_imu_camera and kalibr_calibrate_rs_cameras
+are described below.
+
+### kalibr_calibrate_imu_camera
+
+#### Design variables
+poseDv: asp.BSplinePoseDesignVariable
+gravityDv: aopt.EuclideanPointDv or aopt.EuclideanDirection
+imu Dvs: 
+    gyroBiasDv: asp.EuclideanBSplineDesignVariable
+    accelBiasDv: asp.EuclideanBSplineDesignVariable
+    q_i_b_Dv: aopt.RotationQuaternionDv (can be inactive)
+    r_b_Dv: aopt.EuclideanPointDv (can be inactive)
+    optional imu Dvs for scaledMisalignment: q_gyro_i_Dv, M_accel_Dv, M_gyro_Dv, M_accel_gryo_Dv
+    optional imu Dvs for size effect: rx_i_Dv, ry_i_Dv, rz_i_Dv, Ix_Dv, Iy_Dv, Iz_Dv
+camera Dvs: 
+    T_c_b_Dv: aopt.TransformationDv (T_cNplus1_cN)
+    cameraTimetoImuTimeDv: aopt.Scalar
+
+#### Get values of design variables
+
+gravityDv: toEuclidean()
+accelBiasDv/gyroBiasDv: spline().eval(t) or evalD(t, 0)
+q_i_b_Dv: toRotationMatrix()
+r_b_Dv: toEuclidean()
+poseSplineDv: sm.Transformation(T_w_b.toTransformationMatrix()) where T_w_b=transformationAtTime(timeExpression, 0.0, 0.0)
+
+#### Error terms
+
+CameraChainErrorTerms: error_t(frame, pidx, p) where error_t = self.camera.reprojectionErrorType + setMEstimatorPolicy
+
+The variants of reprojectionErrorType derive from the SimpleReprojectionError C++ class which is exported to python in exportReprojectionError().
+
+The different error types are grouped into a variety of camera models in terms of python classes defined in 
+aslam_cv/aslam_cv_backend_python/python/aslam_cv_backend/\__init\__.py.
+
+AccelerometerErrorTerms: ket.EuclideanError + setMEstimatorPolicy
+GyroscopeErrorTerms: ket.EuclideanError + setMEstimatorPolicy
+Accel and gyro BiasMotionTerms: BSplineEuclideanMotionError
+PoseMotionTerms: MarginalizationPriorErrorTerm (by default inactive)
 
 
-## News / Events
+### kalibr_calibrate_rs_cameras
+This calibration procedure currently (Dec 2021) supports only one camera.
 
-* **Nov 24, 2022** - Some new visualization of trajectory and IMU rate for the generated report along with fixed support for exporting poses to file (see PR [#578](https://github.com/ethz-asl/kalibr/pull/578),[#581](https://github.com/ethz-asl/kalibr/pull/581),[#582](https://github.com/ethz-asl/kalibr/pull/582))
-* **May 3, 2022** - Support for Ubuntu 20.04 along with Docker scripts have been merged into master via PR [#515](https://github.com/ethz-asl/kalibr/pull/515). A large portion was upgrading to Python 3. A special thanks to all the contributors that made this possible. Additionally, contributed fixes for the different validation and visualization scripts have been merged.
-* **Febuary 3, 2020** - Initial Ubuntu 18.04 support has been merged via PR [#241](https://github.com/ethz-asl/kalibr/pull/241). Additionally, support for inputting an initial guess for focal length can be provided from the cmd-line on failure to initialize them.
-* **August 15, 2018** - Double sphere camera models have been contributed to the repository via PR [#210](https://github.com/ethz-asl/kalibr/pull/210). If you are interested you can refer to the [paper](https://arxiv.org/abs/1807.08957) for a nice overview of the models in the repository.
-* **August 25, 2016** - Rolling shutter camera calibration support was added as a feature via PR [#65](https://github.com/ethz-asl/kalibr/pull/65). The [paper](https://www.cv-foundation.org/openaccess/content_cvpr_2013/papers/Oth_Rolling_Shutter_Camera_2013_CVPR_paper.pdf) provides details for those interested.
-* **May 18, 2016** - Support for multiple IMU-to-IMU spacial and IMU intrinsic calibration was released.
-* **June 18, 2014** - Initial public release of the repository.
+#### Design variables
 
-
-## Authors
-* Paul Furgale
-* Hannes Sommer
-* Jérôme Maye
-* Jörn Rehder
-* Thomas Schneider ([email](thomas.schneider@voliro.com))
-* Luc Oth
+landmark_w_dv: aopt.HomogeneousPointDv (by default inactive)
+__poseSpline_dv: asp.BSplinePoseDesignVariable
+__camera_dv: The camera design variables are created by cameraModel.designVariable(self.geometry). 
+The camera design variables are exported to python by exportCameraDesignVariables.
+    projection: DesignVariableAdapter<projection_t>
+    distortion: DesignVariableAdapter<distortion_t>
+    shutter: DesignVariableAdapter<shutter_t>
 
 
-## References
-The calibration approaches used in Kalibr are based on the following papers. Please cite the appropriate papers when using this toolbox or parts of it in an academic publication.
+#### Error terms
 
-1. <a name="joern1"></a>Joern Rehder, Janosch Nikolic, Thomas Schneider, Timo Hinzmann, Roland Siegwart (2016). Extending kalibr: Calibrating the extrinsics of multiple IMUs and of individual axes. In Proceedings of the IEEE International Conference on Robotics and Automation (ICRA), pp. 4304-4311, Stockholm, Sweden.
-1. <a name="paul1"></a>Paul Furgale, Joern Rehder, Roland Siegwart (2013). Unified Temporal and Spatial Calibration for Multi-Sensor Systems. In Proceedings of the IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS), Tokyo, Japan.
-1. <a name="paul2"></a>Paul Furgale, T D Barfoot, G Sibley (2012). Continuous-Time Batch Estimation Using Temporal Basis Functions. In Proceedings of the IEEE International Conference on Robotics and Automation (ICRA), pp. 2088–2095, St. Paul, MN.
-1. <a name="jmaye"></a> J. Maye, P. Furgale, R. Siegwart (2013). Self-supervised Calibration for Robotic Systems, In Proc. of the IEEE Intelligent Vehicles Symposium (IVS)
-1. <a name="othlu"></a>L. Oth, P. Furgale, L. Kneip, R. Siegwart (2013). Rolling Shutter Camera Calibration, In Proc. of the IEEE Computer Vision and Pattern Recognition (CVPR)
+reprojectionErrorAdaptiveCovariance for RS models.
 
-## Acknowledgments
-This work is supported in part by the European Union's Seventh Framework Programme (FP7/2007-2013) under grants #269916 (V-Charge), and #610603 (EUROPA2).
+These error types derive from the CovarianceReprojectionError C++ class, which is exported to python by exportCovarianceReprojectionError.
 
-## License (BSD)
-Copyright (c) 2014, Paul Furgale, Jérôme Maye and Jörn Rehder, Autonomous Systems Lab, ETH Zurich, Switzerland<br>
-Copyright (c) 2014, Thomas Schneider, Skybotix AG, Switzerland<br>
-All rights reserved.<br>
+The different error types are grouped into a variety of camera models in terms of python classes defined in aslam_cv/aslam_cv_backend_python/python/aslam_cv_backend/__init__.py.
 
-Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+Reprojection errors with adaptive covariance is developed solely for rolling shutter cameras as discussed in
+Section 3.5 Error Term Standardisation, Oth et. al., Rolling shutter camera calibration.
+Because of the error standardisation, these reprojection errors depend on not only the camera parameters, 
+but also the pose B splines.
 
-1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+reprojectionError for GS models
 
-1. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+These error types derive from the ReprojectionError C++ class which
+is exported to python by exportReprojectionError. 
+These errors depend on the camera parameters which may be optimized in the kalibr_calibrate_rs_cameras procedure.
 
-1. All advertising materials mentioning features or use of this software must display the following acknowledgement: This product includes software developed by the Autonomous Systems Lab and Skybotix AG.
+regularizer: asp.BSplineMotionError of aslam_nonparametric_estimation/aslam_splines/include/aslam/backend.
 
-1. Neither the name of the Autonomous Systems Lab and Skybotix AG nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+## Citing
+More information about RS camera-IMU calibration and simulation can be found
+at the [report](https://arxiv.org/abs/2108.07200).
+If you find the extension useful, please consider citing it.
 
-THIS SOFTWARE IS PROVIDED BY THE AUTONOMOUS SYSTEMS LAB AND SKYBOTIX AG ''AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL the AUTONOMOUS SYSTEMS LAB OR SKYBOTIX AG BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+@article{huaiContinuoustime2021,
+  title = {Continuous-time spatiotemporal calibration of a rolling shutter camera-{{IMU}} system},
+  author = {Huai, Jianzhu and Zhuang, Yuan and Lin, Yukai and Jozkow, Grzegorz and Yuan, Qicheng and Chen, Dong},
+  journal={IEEE Sensors Journal},
+  year = {2022},
+  month = {feb},
+  doi={10.1109/JSEN.2022.3152572},
+  pages = {1-1}
+}
+```
+
+## Compiled rolling shutter parameters for consumer products
+We have gathered rolling shutter parameters for consumer cameras from a variety of sources, and have calibrated such parameters for consumer cameras by a LED panel.
+These parameters are provided [here](doc/rolling-shutter-table.md) for reference.
+
+
+## TODOs
+* Support calibrating cameras of FOV >= 180 degrees with the equidistant model.
+This can be tested with the calibration sequences of the [TUM VI benchmark](https://vision.in.tum.de/data/datasets/visual-inertial-dataset)
+which uses a camera with 192 degree FOV.
+
+* Support covariance recovery.
+Theoretically, it is possible to recover the covariances for estimated parameters by using Schur complement techniques.
+However, the computation often takes so long that the covariance recovery functions in kalibr_calibrate_imu_camera and
+kalibr_calibrate_rs_cameras are literally useless.
+The cause may be the strong coupling between adjacent control points in B-splines.
