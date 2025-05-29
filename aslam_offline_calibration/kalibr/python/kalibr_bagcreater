@@ -2,7 +2,8 @@
 print("importing libraries")
 
 import rosbag
-import rospy
+import rclpy
+# import rospy
 from sensor_msgs.msg import Image
 from sensor_msgs.msg import Imu
 import time, sys, os

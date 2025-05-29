@@ -4,6 +4,26 @@
 [![ROS1 Ubuntu 18.04](https://github.com/ethz-asl/kalibr/actions/workflows/docker_1804_build.yaml/badge.svg)](https://github.com/ethz-asl/kalibr/actions/workflows/docker_1804_build.yaml)
 [![ROS1 Ubuntu 16.04](https://github.com/ethz-asl/kalibr/actions/workflows/docker_1604_build.yaml/badge.svg)](https://github.com/ethz-asl/kalibr/actions/workflows/docker_1604_build.yaml)
 
+## notes for python3 and ubuntu22
+
+### bagcreator
+
+iin `kalibr/aslam_offline_calibration/kalibr/python`
+
+Create a virtuelenv and install:
+
+    pip3 install bagpy
+
+ (this will include rospy which otherwise doesn't exist in python3)
+
+There will be an import error on `rosbag` which doesn't exist in ros2, it's replaced by rclpy.
+
+See: https://stackoverflow.com/questions/59794328/importing-rosbag-in-python-3
+So replace rospy with rclpy in kalibr_bagcreater and ~/.virtualenvs/kalibr/lib/python3.10/site-packages/rosbag/bag.py.
+
+./kalibr_bagcreater --folder ~/Data/Drones/oakd_lite/. --output-bag toot.bag
+
+
 ## Introduction
 Kalibr is a toolbox that solves the following calibration problems:
 

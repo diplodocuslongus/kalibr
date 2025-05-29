@@ -1,4 +1,6 @@
-#!/usr/bin/env python
+#!/home/ludofw/.virtualenvs/kalibr/bin/python
+
+# #!/usr/bin/env python
 print("importing libraries")
 
 import kalibr_common as kc
